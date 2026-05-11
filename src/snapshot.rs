@@ -6,6 +6,7 @@ use crate::lvm::{self, LvmSnapshot};
 use crate::raid::{self, read_mdstat, MdArray};
 use crate::smart::{self, SmartHealth};
 use crate::zfs::{self, Zpool};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,12 @@ pub struct Snapshot {
     pub diagnostics: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DisplayOptions {
+    pub show_loop: bool,
+    pub show_tmpfs: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 struct OptionalCommandCache {
     zfs: Vec<Zpool>,
@@ -44,6 +51,7 @@ pub struct Sampler {
     sys_block_root: PathBuf,
     mounts_path: PathBuf,
     mdstat_path: PathBuf,
+    display_options: DisplayOptions,
     optional_commands_enabled: bool,
     optional_cache: OptionalCommandCache,
     previous_diskstats: Vec<DiskStat>,
@@ -57,6 +65,7 @@ impl Default for Sampler {
             sys_block_root: PathBuf::from("/sys/block"),
             mounts_path: PathBuf::from("/proc/mounts"),
             mdstat_path: PathBuf::from("/proc/mdstat"),
+            display_options: DisplayOptions::default(),
             optional_commands_enabled: true,
             optional_cache: OptionalCommandCache::default(),
             previous_diskstats: Vec::new(),
@@ -87,6 +96,7 @@ impl Sampler {
             sys_block_root,
             mounts_path,
             mdstat_path,
+            display_options: DisplayOptions::default(),
             optional_commands_enabled: false,
             optional_cache: OptionalCommandCache::default(),
             previous_diskstats: Vec::new(),
@@ -119,9 +129,14 @@ impl Sampler {
         self.sample_at(Instant::now())
     }
 
+    pub fn with_display_options(mut self, display_options: DisplayOptions) -> Self {
+        self.display_options = display_options;
+        self
+    }
+
     pub fn sample_at(&mut self, now: Instant) -> Snapshot {
         let current_diskstats = read_diskstats(&self.diskstats_path);
-        let activity = self
+        let mut activity = self
             .previous_at
             .map(|previous_at| {
                 activities_between(
@@ -132,8 +147,12 @@ impl Sampler {
             })
             .unwrap_or_default();
 
-        let devices = collect_block_devices(&self.sys_block_root);
-        let filesystems = collect_filesystems(&self.mounts_path);
+        let mut devices = collect_block_devices(&self.sys_block_root);
+        let duplicate_mappers = duplicate_mappers(&devices);
+        activity = filter_activity(activity, &duplicate_mappers, self.display_options);
+        devices = filter_devices(devices, &duplicate_mappers, self.display_options);
+        let filesystems =
+            filter_filesystems(collect_filesystems(&self.mounts_path), self.display_options);
         let mut mdraid = read_mdstat(&self.mdstat_path);
         let optional_commands = self.optional_commands_snapshot(&devices, now);
         raid::apply_mdadm_detail_scan(&mut mdraid, &optional_commands.mdadm_scan);
@@ -228,6 +247,61 @@ impl Sampler {
 
         optional_cache(zfs, mdadm_scan, lvm, smart, diagnostics)
     }
+}
+
+fn duplicate_mappers(devices: &[BlockDevice]) -> HashSet<String> {
+    devices
+        .iter()
+        .filter(|device| device.device_type == "dm" && device.slaves.len() == 1)
+        .map(|device| device.name.clone())
+        .collect()
+}
+
+fn filter_activity(
+    activity: Vec<DiskActivity>,
+    duplicate_mappers: &HashSet<String>,
+    display_options: DisplayOptions,
+) -> Vec<DiskActivity> {
+    activity
+        .into_iter()
+        .filter(|activity| display_options.show_loop || !is_loop_name(&activity.name))
+        .filter(|activity| !duplicate_mappers.contains(&activity.name))
+        .collect()
+}
+
+fn filter_devices(
+    devices: Vec<BlockDevice>,
+    duplicate_mappers: &HashSet<String>,
+    display_options: DisplayOptions,
+) -> Vec<BlockDevice> {
+    devices
+        .into_iter()
+        .filter(|device| display_options.show_loop || !is_loop_device(device))
+        .filter(|device| !duplicate_mappers.contains(&device.name))
+        .collect()
+}
+
+fn filter_filesystems(
+    filesystems: Vec<FilesystemUsage>,
+    display_options: DisplayOptions,
+) -> Vec<FilesystemUsage> {
+    filesystems
+        .into_iter()
+        .filter(|filesystem| display_options.show_loop || !is_loop_filesystem(filesystem))
+        .filter(|filesystem| display_options.show_tmpfs || filesystem.fs_type != "tmpfs")
+        .collect()
+}
+
+fn is_loop_device(device: &BlockDevice) -> bool {
+    device.device_type == "loop" || is_loop_name(&device.name)
+}
+
+fn is_loop_name(name: &str) -> bool {
+    name.starts_with("loop")
+}
+
+fn is_loop_filesystem(filesystem: &FilesystemUsage) -> bool {
+    filesystem.source.starts_with("/dev/loop")
 }
 
 fn optional_cache(
@@ -436,6 +510,155 @@ mod tests {
     }
 
     #[test]
+    fn sampler_hides_loop_devices_and_tmpfs_by_default() {
+        let temp = TempDir::new().unwrap();
+        let diskstats = temp.path().join("diskstats");
+        let sys_block = temp.path().join("sys/block");
+        let mounts = temp.path().join("mounts");
+        let mdstat = temp.path().join("mdstat");
+        let root = temp.path().join("root");
+        let snap = temp.path().join("snap/tool");
+        let shm = temp.path().join("dev/shm");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&snap).unwrap();
+        fs::create_dir_all(&shm).unwrap();
+
+        write(
+            &diskstats,
+            "\
+8 0 sda 10 0 200 0 5 0 80 0 0 40 50 0 0 0 0 0 0
+7 0 loop0 10 0 200 0 5 0 80 0 0 40 50 0 0 0 0 0 0
+",
+        );
+        write(&sys_block.join("sda/size"), "2097152\n");
+        write(&sys_block.join("loop0/size"), "1024\n");
+        write(
+            &mounts,
+            &format!(
+                "/dev/sda1 {} ext4 rw 0 0\n/dev/loop0 {} squashfs ro 0 0\ntmpfs {} tmpfs rw 0 0\n",
+                root.display(),
+                snap.display(),
+                shm.display()
+            ),
+        );
+        write(&mdstat, "");
+
+        let mut sampler = Sampler::new_for_tests_with_paths(diskstats, sys_block, mounts, mdstat);
+        let started = Instant::now();
+        let _ = sampler.sample_at(started);
+        write(
+            &sampler.diskstats_path,
+            "\
+8 0 sda 12 0 712 0 9 0 592 0 0 140 150 0 0 0 0 0 0
+7 0 loop0 12 0 712 0 9 0 592 0 0 140 150 0 0 0 0 0 0
+",
+        );
+
+        let snapshot = sampler.sample_at(started + Duration::from_secs(1));
+
+        assert_eq!(names(&snapshot.activity), ["sda"]);
+        assert_eq!(device_names(&snapshot.devices), ["sda"]);
+        assert_eq!(filesystem_sources(&snapshot.filesystems), ["/dev/sda1"]);
+    }
+
+    #[test]
+    fn sampler_can_show_loop_devices_and_tmpfs_when_enabled() {
+        let temp = TempDir::new().unwrap();
+        let diskstats = temp.path().join("diskstats");
+        let sys_block = temp.path().join("sys/block");
+        let mounts = temp.path().join("mounts");
+        let mdstat = temp.path().join("mdstat");
+        let root = temp.path().join("root");
+        let snap = temp.path().join("snap/tool");
+        let shm = temp.path().join("dev/shm");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&snap).unwrap();
+        fs::create_dir_all(&shm).unwrap();
+
+        write(
+            &diskstats,
+            "\
+8 0 sda 10 0 200 0 5 0 80 0 0 40 50 0 0 0 0 0 0
+7 0 loop0 10 0 200 0 5 0 80 0 0 40 50 0 0 0 0 0 0
+",
+        );
+        write(&sys_block.join("sda/size"), "2097152\n");
+        write(&sys_block.join("loop0/size"), "1024\n");
+        write(
+            &mounts,
+            &format!(
+                "/dev/sda1 {} ext4 rw 0 0\n/dev/loop0 {} squashfs ro 0 0\ntmpfs {} tmpfs rw 0 0\n",
+                root.display(),
+                snap.display(),
+                shm.display()
+            ),
+        );
+        write(&mdstat, "");
+
+        let mut sampler = Sampler::new_for_tests_with_paths(diskstats, sys_block, mounts, mdstat);
+        sampler.display_options = DisplayOptions {
+            show_loop: true,
+            show_tmpfs: true,
+        };
+        let started = Instant::now();
+        let _ = sampler.sample_at(started);
+        write(
+            &sampler.diskstats_path,
+            "\
+8 0 sda 12 0 712 0 9 0 592 0 0 140 150 0 0 0 0 0 0
+7 0 loop0 12 0 712 0 9 0 592 0 0 140 150 0 0 0 0 0 0
+",
+        );
+
+        let snapshot = sampler.sample_at(started + Duration::from_secs(1));
+
+        assert_eq!(names(&snapshot.activity), ["sda", "loop0"]);
+        assert_eq!(device_names(&snapshot.devices), ["loop0", "sda"]);
+        assert_eq!(
+            filesystem_sources(&snapshot.filesystems),
+            ["/dev/sda1", "/dev/loop0", "tmpfs"]
+        );
+    }
+
+    #[test]
+    fn sampler_hides_single_slave_dm_activity_and_device_duplicates() {
+        let temp = TempDir::new().unwrap();
+        let diskstats = temp.path().join("diskstats");
+        let sys_block = temp.path().join("sys/block");
+        let mounts = temp.path().join("mounts");
+        let mdstat = temp.path().join("mdstat");
+
+        write(
+            &diskstats,
+            "\
+259 3 nvme0n1p3 10 0 200 0 5 0 80 0 0 40 50 0 0 0 0 0 0
+253 0 dm-0 10 0 200 0 5 0 80 0 0 40 50 0 0 0 0 0 0
+",
+        );
+        write(&sys_block.join("nvme0n1p3/size"), "2097152\n");
+        write(&sys_block.join("dm-0/size"), "2097152\n");
+        fs::create_dir_all(sys_block.join("dm-0/slaves/nvme0n1p3")).unwrap();
+        write(&mounts, "");
+        write(&mdstat, "");
+
+        let mut sampler = Sampler::new_for_tests_with_paths(diskstats, sys_block, mounts, mdstat);
+        let started = Instant::now();
+        let _ = sampler.sample_at(started);
+        write(
+            &sampler.diskstats_path,
+            "\
+259 3 nvme0n1p3 12 0 712 0 9 0 592 0 0 140 150 0 0 0 0 0 0
+253 0 dm-0 12 0 712 0 9 0 592 0 0 140 150 0 0 0 0 0 0
+",
+        );
+
+        let snapshot = sampler.sample_at(started + Duration::from_secs(1));
+
+        assert_eq!(names(&snapshot.activity), ["nvme0n1p3"]);
+        assert_eq!(device_names(&snapshot.devices), ["nvme0n1p3"]);
+    }
+
+    #[test]
     fn sampler_reuses_cached_optional_commands_between_refreshes() {
         let temp = TempDir::new().unwrap();
         let diskstats = temp.path().join("diskstats");
@@ -484,5 +707,23 @@ mod tests {
             (actual - expected).abs() < 64.0,
             "expected {actual} to be close to {expected}"
         );
+    }
+
+    fn names(activity: &[DiskActivity]) -> Vec<&str> {
+        activity
+            .iter()
+            .map(|activity| activity.name.as_str())
+            .collect()
+    }
+
+    fn device_names(devices: &[BlockDevice]) -> Vec<&str> {
+        devices.iter().map(|device| device.name.as_str()).collect()
+    }
+
+    fn filesystem_sources(filesystems: &[FilesystemUsage]) -> Vec<&str> {
+        filesystems
+            .iter()
+            .map(|filesystem| filesystem.source.as_str())
+            .collect()
     }
 }

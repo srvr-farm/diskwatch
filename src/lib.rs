@@ -11,7 +11,7 @@ pub mod snapshot;
 pub mod zfs;
 
 use crate::cli::Cli;
-use crate::snapshot::Sampler;
+use crate::snapshot::{DisplayOptions, Sampler};
 use anyhow::Context;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -30,15 +30,19 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 pub fn run_with_cli(cli: Cli) -> anyhow::Result<()> {
+    let display_options = DisplayOptions {
+        show_loop: cli.show_loop,
+        show_tmpfs: cli.show_tmpfs,
+    };
     if cli.once {
-        run_once(cli.interval)
+        run_once(cli.interval, display_options)
     } else {
-        run_tui(cli.interval)
+        run_tui(cli.interval, display_options)
     }
 }
 
-fn run_once(interval: Duration) -> anyhow::Result<()> {
-    let mut sampler = Sampler::default();
+fn run_once(interval: Duration, display_options: DisplayOptions) -> anyhow::Result<()> {
+    let mut sampler = Sampler::default().with_display_options(display_options);
     let _ = sampler.sample();
     thread::sleep(interval);
     let snapshot = sampler.sample();
@@ -57,7 +61,7 @@ where
     }
 }
 
-fn run_tui(interval: Duration) -> anyhow::Result<()> {
+fn run_tui(interval: Duration, display_options: DisplayOptions) -> anyhow::Result<()> {
     let mut stdout = io::stdout();
     enable_raw_mode().context("enable raw mode")?;
     enter_alternate_screen_or_restore_raw_mode(&mut stdout, disable_raw_mode)
@@ -68,7 +72,7 @@ fn run_tui(interval: Duration) -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend).context("initialize terminal")?;
     terminal.clear().context("clear terminal")?;
 
-    let mut sampler = Sampler::default();
+    let mut sampler = Sampler::default().with_display_options(display_options);
     let mut snapshot = sampler.sample();
     let mut last_tick = Instant::now();
 

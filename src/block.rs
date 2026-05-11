@@ -8,6 +8,7 @@ pub struct BlockDevice {
     pub name: String,
     pub device_type: String,
     pub size_bytes: u64,
+    pub slaves: Vec<String>,
     pub rotational: Option<bool>,
     pub logical_block_size: Option<u64>,
     pub physical_block_size: Option<u64>,
@@ -35,6 +36,7 @@ fn collect_device(path: &Path) -> Option<BlockDevice> {
     Some(BlockDevice {
         device_type: device_type(path, &name),
         size_bytes: size_sectors.saturating_mul(SECTOR_BYTES),
+        slaves: read_slave_names(&path.join("slaves")),
         rotational: read_bool(&path.join("queue/rotational")),
         logical_block_size: read_u64(&path.join("queue/logical_block_size")),
         physical_block_size: read_u64(&path.join("queue/physical_block_size")),
@@ -77,6 +79,16 @@ fn infer_device_type(name: &str) -> &'static str {
     } else {
         "disk"
     }
+}
+
+fn read_slave_names(path: &Path) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(path)
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names
 }
 
 fn read_bool(path: &Path) -> Option<bool> {
@@ -216,6 +228,19 @@ mod tests {
             assert_eq!(devices.len(), 1);
             assert_eq!(devices[0].device_type, expected_type);
         }
+    }
+
+    #[test]
+    fn collects_device_slave_names() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join("dm-0/slaves/nvme0n1p3")).unwrap();
+        std::fs::create_dir_all(temp.path().join("dm-0/slaves/nvme0n1p2")).unwrap();
+
+        let devices = collect(temp.path());
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "dm-0");
+        assert_eq!(devices[0].slaves, ["nvme0n1p2", "nvme0n1p3"]);
     }
 
     #[test]

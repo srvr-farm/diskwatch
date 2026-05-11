@@ -16,8 +16,9 @@ Use `diskwatch` when you want to:
   and busy percentage from Linux disk statistics.
 - Inspect mounted filesystem capacity, including used, available, total, and
   percent used. Kernel pseudo filesystems are filtered, while capacity-bearing
-  mounts such as container overlay roots and tmpfs mounts are retained. Remote
-  and FUSE mounts are skipped to avoid blocking on stale network filesystems.
+  mounts such as container overlay roots are retained. Tmpfs mounts are hidden
+  by default and can be shown with `--tmpfs`. Remote and FUSE mounts are skipped
+  to avoid blocking on stale network filesystems.
 - Inspect block-device inventory, including size, type, rotational hint, logical
   and physical sector size, vendor, model, and serial where readable.
 - Check ZFS pool capacity and health when `zpool` is installed.
@@ -427,6 +428,19 @@ In `--once` mode, `diskwatch` takes an initial sample, waits for the interval,
 then takes a second sample so activity rates can be computed from counter
 deltas.
 
+Loop devices and loop-backed filesystem rows are hidden by default. Show them
+when needed:
+
+```sh
+diskwatch --loop
+```
+
+Tmpfs filesystem rows are hidden by default. Show them when needed:
+
+```sh
+diskwatch --tmpfs
+```
+
 Show CLI help:
 
 ```sh
@@ -441,6 +455,8 @@ Usage: diskwatch [OPTIONS]
 Options:
       --interval <INTERVAL>  [default: 1s]
       --once
+      --loop
+      --tmpfs
   -h, --help                 Print help
 ```
 

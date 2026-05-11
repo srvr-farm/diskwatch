@@ -7,6 +7,10 @@ pub struct Cli {
     pub interval: Duration,
     #[arg(long)]
     pub once: bool,
+    #[arg(long = "loop")]
+    pub show_loop: bool,
+    #[arg(long = "tmpfs")]
+    pub show_tmpfs: bool,
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
@@ -39,6 +43,13 @@ mod tests {
     fn parses_once_mode() {
         let cli = Cli::try_parse_from(["diskwatch", "--once"]).unwrap();
         assert!(cli.once);
+    }
+
+    #[test]
+    fn parses_loop_and_tmpfs_display_flags() {
+        let cli = Cli::try_parse_from(["diskwatch", "--loop", "--tmpfs"]).unwrap();
+        assert!(cli.show_loop);
+        assert!(cli.show_tmpfs);
     }
 
     #[test]
