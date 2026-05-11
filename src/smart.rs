@@ -26,7 +26,8 @@ pub fn parse_smartctl(device: &str, input: &str) -> SmartHealth {
         }
 
         if is_temperature_line(&lower) {
-            health.temperature_celsius = last_integer(trimmed).or(health.temperature_celsius);
+            health.temperature_celsius =
+                parse_temperature_celsius(trimmed).or(health.temperature_celsius);
         }
 
         if lower.contains("power_on_hours") || lower.contains("power on hours") {
@@ -80,13 +81,18 @@ fn is_temperature_line(lower: &str) -> bool {
         || lower.starts_with("temperature:")
 }
 
+fn parse_temperature_celsius(line: &str) -> Option<u64> {
+    let current_value = line.split_once('(').map_or(line, |(value, _)| value);
+    last_integer(current_value)
+}
+
 fn is_wearout_line(line: &str) -> bool {
-    line.split_whitespace().next().is_some_and(|attribute| {
-        attribute.contains("Wear")
-            || attribute.contains("Media_Wearout")
-            || attribute.contains("Percent_Lifetime")
-            || attribute.contains("Percentage_Used")
-    })
+    let lower = line.to_ascii_lowercase();
+    lower.contains("wear")
+        || lower.contains("media_wearout")
+        || lower.contains("percent_lifetime")
+        || lower.contains("percentage_used")
+        || lower.contains("percentage used")
 }
 
 fn should_collect_device(device: &BlockDevice) -> bool {
@@ -102,7 +108,7 @@ fn last_integer(input: &str) -> Option<u64> {
         .split(|character: char| !character.is_ascii_digit())
         .filter(|value| !value.is_empty())
         .filter_map(|value| value.parse().ok())
-        .last()
+        .next_back()
 }
 
 #[cfg(test)]
@@ -117,5 +123,32 @@ mod tests {
         assert_eq!(health.health.as_deref(), Some("PASSED"));
         assert_eq!(health.temperature_celsius, Some(30));
         assert_eq!(health.power_on_hours, Some(1234));
+    }
+
+    #[test]
+    fn parses_current_temperature_before_min_max_values() {
+        let input = "194 Temperature_Celsius     0x0022   064   052   000    Old_age   Always       -       36 (Min/Max 18/49)\n";
+
+        let health = parse_smartctl("/dev/sda", input);
+
+        assert_eq!(health.temperature_celsius, Some(36));
+    }
+
+    #[test]
+    fn parses_nvme_percentage_used() {
+        let input = "Percentage Used:                    2%\n";
+
+        let health = parse_smartctl("/dev/nvme0n1", input);
+
+        assert_eq!(health.wearout_percent, Some(2));
+    }
+
+    #[test]
+    fn parses_ata_wear_leveling_count() {
+        let input = "177 Wear_Leveling_Count     0x0013   096   096   010    Pre-fail  Always       -       4\n";
+
+        let health = parse_smartctl("/dev/sda", input);
+
+        assert_eq!(health.wearout_percent, Some(4));
     }
 }
