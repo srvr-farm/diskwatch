@@ -31,7 +31,7 @@ pub fn parse_smartctl(device: &str, input: &str) -> SmartHealth {
         }
 
         if lower.contains("power_on_hours") || lower.contains("power on hours") {
-            health.power_on_hours = last_integer(trimmed).or(health.power_on_hours);
+            health.power_on_hours = parse_power_on_hours(trimmed).or(health.power_on_hours);
         }
 
         if let Some(wearout_percent) = parse_wearout_percent(trimmed) {
@@ -86,6 +86,14 @@ fn parse_temperature_celsius(line: &str) -> Option<u64> {
     last_integer(current_value)
 }
 
+fn parse_power_on_hours(line: &str) -> Option<u64> {
+    if let Some(raw_value) = smart_attribute_raw_value(line) {
+        return first_integer(raw_value);
+    }
+
+    last_integer(line)
+}
+
 fn parse_wearout_percent(line: &str) -> Option<u64> {
     let lower = line.to_ascii_lowercase();
 
@@ -133,8 +141,20 @@ fn smart_attribute_value(line: &str) -> Option<u64> {
     line.split_whitespace().nth(3)?.parse().ok()
 }
 
+fn smart_attribute_raw_value(line: &str) -> Option<&str> {
+    line.split_whitespace().nth(8)
+}
+
 fn remaining_to_used_percent(remaining: u64) -> u64 {
     100_u64.saturating_sub(remaining)
+}
+
+fn first_integer(input: &str) -> Option<u64> {
+    let normalized = normalize_grouped_digits(input);
+    normalized
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|value| !value.is_empty())
+        .find_map(|value| value.parse().ok())
 }
 
 fn normalize_grouped_digits(input: &str) -> String {
@@ -204,6 +224,25 @@ mod tests {
 
         let health = parse_smartctl("/dev/sda", input);
 
+        assert_eq!(health.power_on_hours, Some(1234));
+    }
+
+    #[test]
+    fn parses_compound_power_on_hours() {
+        let input = "Power_On_Hours          0x0032   100   100   000    Old_age   Always       -       1234h+56m+00.000s\n";
+
+        let health = parse_smartctl("/dev/sda", input);
+
+        assert_eq!(health.power_on_hours, Some(1234));
+    }
+
+    #[test]
+    fn parses_smartctl_bitmask_stdout() {
+        let input = "SMART overall-health self-assessment test result: PASSED\nPower_On_Hours          0x0032   100   100   000    Old_age   Always       -       1234\n";
+
+        let health = parse_smartctl("/dev/sda", input);
+
+        assert_eq!(health.health.as_deref(), Some("PASSED"));
         assert_eq!(health.power_on_hours, Some(1234));
     }
 

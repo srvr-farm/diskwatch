@@ -177,9 +177,19 @@ fn output_result(
         };
     }
 
-    OptionalCommandOutput {
-        output: None,
-        diagnostic: Some(exit_diagnostic(program, status, &output.stderr)),
+    match String::from_utf8(output.stdout) {
+        Ok(stdout) => OptionalCommandOutput {
+            output: if stdout.is_empty() {
+                None
+            } else {
+                Some(stdout)
+            },
+            diagnostic: Some(exit_diagnostic(program, status, &output.stderr)),
+        },
+        Err(error) => OptionalCommandOutput {
+            output: None,
+            diagnostic: Some(format!("{program} stdout was not valid UTF-8: {error}")),
+        },
     }
 }
 
@@ -362,6 +372,35 @@ mod tests {
         let diagnostic = result.diagnostic.unwrap();
         assert!(diagnostic.contains("exited with"));
         assert!(!diagnostic.ends_with(": "));
+    }
+
+    #[test]
+    fn non_zero_exit_preserves_stdout_and_reports_diagnostic() {
+        let result = run_optional(
+            "sh",
+            &[
+                "-c",
+                "printf 'SMART overall-health self-assessment test result: PASSED\n'; printf 'bitmask status' >&2; exit 4",
+            ],
+            Duration::from_secs(1),
+        );
+
+        assert!(
+            result
+                .output
+                .as_deref()
+                .is_some_and(|output| output.contains("PASSED")),
+            "expected stdout to be preserved, got {:?}",
+            result.output
+        );
+        assert!(
+            result
+                .diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("bitmask status")),
+            "expected non-zero diagnostic, got {:?}",
+            result.diagnostic
+        );
     }
 
     #[test]
