@@ -1,9 +1,12 @@
 use std::env;
 use std::io::{self, Read};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+const STDERR_DIAGNOSTIC_LIMIT: usize = 512;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OptionalCommandOutput {
@@ -19,12 +22,25 @@ pub fn run_optional(program: &str, args: &[&str], timeout: Duration) -> Optional
         };
     }
 
-    let mut child = match Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+
+    // SAFETY: `pre_exec` runs after fork and before exec in the child. The closure only calls
+    // `setpgid`, which is async-signal-safe on Linux, so it is safe for this context.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    }
+
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             return OptionalCommandOutput {
@@ -33,18 +49,21 @@ pub fn run_optional(program: &str, args: &[&str], timeout: Duration) -> Optional
             };
         }
     };
+    ensure_child_process_group(&child);
+    let process_group = ProcessGroup::from_child(&child);
 
     let stdout = child.stdout.take().map(spawn_reader);
     let stderr = child.stderr.take().map(spawn_reader);
 
     if timeout.is_zero() {
-        return timeout_result(program, child, stdout, stderr, timeout);
+        return timeout_result(program, child, process_group, stdout, stderr, timeout);
     }
 
     let started = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                kill_process_group(process_group);
                 let output = match collect_output(program, stdout, stderr) {
                     Ok(output) => output,
                     Err(diagnostic) => {
@@ -58,11 +77,11 @@ pub fn run_optional(program: &str, args: &[&str], timeout: Duration) -> Optional
                 return output_result(program, status, output);
             }
             Ok(None) if started.elapsed() >= timeout => {
-                return timeout_result(program, child, stdout, stderr, timeout);
+                return timeout_result(program, child, process_group, stdout, stderr, timeout);
             }
             Ok(None) => thread::sleep(poll_interval(started, timeout)),
             Err(error) => {
-                let _ = child.kill();
+                kill_process_group(process_group);
                 let _ = child.wait();
                 let _ = collect_output(program, stdout, stderr);
                 return OptionalCommandOutput {
@@ -71,6 +90,29 @@ pub fn run_optional(program: &str, args: &[&str], timeout: Duration) -> Optional
                 };
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessGroup {
+    pgid: libc::pid_t,
+}
+
+impl ProcessGroup {
+    fn from_child(child: &Child) -> Self {
+        Self {
+            pgid: child.id() as libc::pid_t,
+        }
+    }
+}
+
+fn ensure_child_process_group(child: &Child) {
+    let pid = child.id() as libc::pid_t;
+
+    // SAFETY: `setpgid` is called with the spawned child pid and desired pgid. It does not
+    // dereference pointers; failures are acceptable because child-side `pre_exec` also sets it.
+    unsafe {
+        let _ = libc::setpgid(pid, pid);
     }
 }
 
@@ -143,7 +185,7 @@ fn output_result(
 
 fn exit_diagnostic(program: &str, status: ExitStatus, stderr: &[u8]) -> String {
     let stderr = String::from_utf8_lossy(stderr);
-    let stderr = stderr.trim();
+    let stderr = truncate_diagnostic(stderr.trim());
     if stderr.is_empty() {
         format!("{program} exited with {status}")
     } else {
@@ -153,18 +195,45 @@ fn exit_diagnostic(program: &str, status: ExitStatus, stderr: &[u8]) -> String {
 
 fn timeout_result(
     program: &str,
-    mut child: std::process::Child,
+    mut child: Child,
+    process_group: ProcessGroup,
     stdout: Option<JoinHandle<io::Result<Vec<u8>>>>,
     stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
     timeout: Duration,
 ) -> OptionalCommandOutput {
-    let _ = child.kill();
+    kill_process_group(process_group);
     let _ = child.wait();
     let _ = collect_output(program, stdout, stderr);
     OptionalCommandOutput {
         output: None,
         diagnostic: Some(format!("{program} timed out after {timeout:?}")),
     }
+}
+
+fn kill_process_group(process_group: ProcessGroup) {
+    if process_group.pgid <= 0 {
+        return;
+    }
+
+    // SAFETY: `kill` is called with a negative process-group id derived from the spawned child
+    // pid. It does not dereference pointers, and ESRCH is acceptable when the group already exited.
+    unsafe {
+        let _ = libc::kill(-process_group.pgid, libc::SIGKILL);
+    }
+}
+
+fn truncate_diagnostic(diagnostic: &str) -> String {
+    if diagnostic.len() <= STDERR_DIAGNOSTIC_LIMIT {
+        return diagnostic.to_owned();
+    }
+
+    let mut truncated = diagnostic
+        .char_indices()
+        .take_while(|(index, _)| *index < STDERR_DIAGNOSTIC_LIMIT)
+        .map(|(_, character)| character)
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn poll_interval(started: Instant, timeout: Duration) -> Duration {
@@ -234,6 +303,45 @@ mod tests {
                 .is_some_and(|diagnostic| diagnostic.contains("timed out")),
             "expected timeout diagnostic, got {:?}",
             result.diagnostic
+        );
+    }
+
+    #[test]
+    fn timeout_kills_descendant_holding_output_pipes() {
+        let started = Instant::now();
+        let result = run_optional("sh", &["-c", "sleep 1 & wait"], Duration::from_millis(25));
+
+        assert!(result.output.is_none());
+        assert!(
+            result
+                .diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("timed out")),
+            "expected timeout diagnostic, got {:?}",
+            result.diagnostic
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "timeout waited for descendant sleep: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn successful_exit_cleans_up_lingering_descendant_holding_output_pipes() {
+        let started = Instant::now();
+        let result = run_optional(
+            "sh",
+            &["-c", "sleep 1 & printf done"],
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(result.output.as_deref(), Some("done"));
+        assert_eq!(result.diagnostic, None);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "successful command waited for lingering descendant: {:?}",
+            started.elapsed()
         );
     }
 
