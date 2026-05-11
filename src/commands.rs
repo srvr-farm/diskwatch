@@ -1,12 +1,14 @@
 use std::env;
 use std::io::{self, ErrorKind, Read};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+const COMMAND_OUTPUT_LIMIT: usize = 1024 * 1024;
 const STDERR_DIAGNOSTIC_LIMIT: usize = 512;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -263,6 +265,13 @@ where
     let reached_eof = loop {
         match stream.read(&mut buffer) {
             Ok(0) => break true,
+            Ok(bytes_read) if output.len().saturating_add(bytes_read) > COMMAND_OUTPUT_LIMIT => {
+                let remaining = COMMAND_OUTPUT_LIMIT.saturating_sub(output.len());
+                output.extend_from_slice(&buffer[..remaining]);
+                return Err(format!(
+                    "{program} {stream_name} output exceeded {COMMAND_OUTPUT_LIMIT} bytes"
+                ));
+            }
             Ok(bytes_read) => output.extend_from_slice(&buffer[..bytes_read]),
             Err(error) if error.kind() == ErrorKind::WouldBlock => break false,
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
@@ -379,14 +388,19 @@ pub fn program_available(program: &str) -> bool {
 fn find_in_path(program: &str) -> Option<PathBuf> {
     let path = Path::new(program);
     if path.components().count() > 1 {
-        return path.is_file().then(|| path.to_path_buf());
+        return is_executable_file(path).then(|| path.to_path_buf());
     }
 
     env::var_os("PATH").and_then(|paths| {
         env::split_paths(&paths)
             .map(|directory| directory.join(program))
-            .find(|candidate| candidate.is_file())
+            .find(|candidate| is_executable_file(candidate))
     })
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(test)]
@@ -423,6 +437,32 @@ mod tests {
         );
         assert_eq!(result.output.as_ref().map(String::len), Some(200_000));
         assert_eq!(result.diagnostic, None);
+    }
+
+    #[test]
+    fn caps_stdout_from_noisy_optional_commands() {
+        if find_in_path("yes").is_none() || find_in_path("head").is_none() {
+            return;
+        }
+
+        let result = run_optional(
+            "sh",
+            &[
+                "-c",
+                &format!("yes x | head -c {}", COMMAND_OUTPUT_LIMIT + 1),
+            ],
+            Duration::from_secs(2),
+        );
+
+        assert!(result.output.is_none());
+        assert!(
+            result
+                .diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("stdout output exceeded")),
+            "expected output cap diagnostic, got {:?}",
+            result.diagnostic
+        );
     }
 
     #[test]
@@ -615,5 +655,27 @@ mod tests {
             .is_some_and(|diagnostic| diagnostic.contains("timed out")));
         assert!(budget.exhausted());
         assert!(run_optional_budgeted("printf", &["hello"], &budget).is_none());
+    }
+
+    #[test]
+    fn non_executable_path_is_not_available() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "#!/bin/sh").unwrap();
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let result = run_optional(
+            file.path().to_str().unwrap(),
+            &[],
+            Duration::from_millis(50),
+        );
+
+        assert!(result.output.is_none());
+        assert!(result
+            .diagnostic
+            .as_deref()
+            .is_some_and(|diagnostic| diagnostic.contains("not found")));
     }
 }

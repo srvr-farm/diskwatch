@@ -175,10 +175,7 @@ fn parse_wearout_percent(line: &str) -> Option<u64> {
 
 fn should_collect_device(device: &BlockDevice) -> bool {
     !device.name.starts_with("loop")
-        && matches!(
-            device.device_type.as_str(),
-            "disk" | "nvme" | "mmc" | "zbc" | "dm"
-        )
+        && matches!(device.device_type.as_str(), "disk" | "nvme" | "mmc" | "zbc")
 }
 
 fn last_integer(input: &str) -> Option<u64> {
@@ -364,5 +361,33 @@ mod tests {
 
         assert!(health.is_empty());
         assert_eq!(diagnostics, ["smartctl not found"]);
+    }
+
+    #[test]
+    fn smart_candidates_skip_dm_logical_devices() {
+        let devices = vec![
+            BlockDevice {
+                name: "dm-0".to_string(),
+                device_type: "dm".to_string(),
+                ..BlockDevice::default()
+            },
+            BlockDevice {
+                name: "sda".to_string(),
+                device_type: "disk".to_string(),
+                ..BlockDevice::default()
+            },
+            BlockDevice {
+                name: "nvme0n1".to_string(),
+                device_type: "nvme".to_string(),
+                ..BlockDevice::default()
+            },
+        ];
+
+        let names: Vec<_> = collectable_devices(&devices)
+            .into_iter()
+            .map(|device| device.name.as_str())
+            .collect();
+
+        assert_eq!(names, ["sda", "nvme0n1"]);
     }
 }

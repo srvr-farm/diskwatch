@@ -268,12 +268,7 @@ fn append_budget_exhausted_if_needed(
 fn optional_device_names(devices: &[BlockDevice]) -> Vec<String> {
     devices
         .iter()
-        .filter(|device| {
-            matches!(
-                device.device_type.as_str(),
-                "disk" | "nvme" | "mmc" | "zbc" | "dm"
-            )
-        })
+        .filter(|device| matches!(device.device_type.as_str(), "disk" | "nvme" | "mmc" | "zbc"))
         .map(|device| device.name.clone())
         .collect()
 }
