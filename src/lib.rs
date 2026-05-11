@@ -41,7 +41,8 @@ fn run_once(interval: Duration) -> anyhow::Result<()> {
 fn run_tui(interval: Duration) -> anyhow::Result<()> {
     let mut stdout = io::stdout();
     enable_raw_mode().context("enable raw mode")?;
-    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+    enter_alternate_screen_or_restore_raw_mode(&mut stdout, disable_raw_mode)
+        .context("enter alternate screen")?;
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(stdout);
@@ -85,6 +86,21 @@ fn run_tui(interval: Duration) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn enter_alternate_screen_or_restore_raw_mode<W, F>(
+    stdout: &mut W,
+    mut disable_raw_mode: F,
+) -> io::Result<()>
+where
+    W: io::Write,
+    F: FnMut() -> io::Result<()>,
+{
+    if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn should_quit(code: KeyCode, modifiers: KeyModifiers) -> bool {
     matches!(code, KeyCode::Esc)
         || matches!(code, KeyCode::Char('q'))
@@ -104,6 +120,19 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
+    use std::io::{self, Write};
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("write failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn should_quit_accepts_q_escape_and_ctrl_c() {
@@ -111,5 +140,18 @@ mod tests {
         assert!(should_quit(KeyCode::Esc, KeyModifiers::NONE));
         assert!(should_quit(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!should_quit(KeyCode::Char('c'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn enter_alternate_screen_failure_restores_raw_mode() {
+        let mut disable_raw_mode_called = false;
+        let error = enter_alternate_screen_or_restore_raw_mode(&mut FailingWriter, || {
+            disable_raw_mode_called = true;
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(disable_raw_mode_called);
     }
 }

@@ -4,7 +4,9 @@ pub struct Snapshot {
 }
 
 #[derive(Debug, Default)]
-pub struct Sampler;
+pub struct Sampler {
+    _private: (),
+}
 
 impl Sampler {
     pub fn sample(&mut self) -> Snapshot {
