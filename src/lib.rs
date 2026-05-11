@@ -1,6 +1,7 @@
 pub mod block;
 pub mod cli;
 pub mod diskstats;
+pub mod filesystems;
 pub mod render;
 pub mod snapshot;
 

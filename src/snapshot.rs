@@ -1,5 +1,6 @@
 use crate::block::{collect as collect_block_devices, BlockDevice};
 use crate::diskstats::{activities_between, read_diskstats, DiskActivity, DiskStat};
+use crate::filesystems::{collect as collect_filesystems, FilesystemUsage};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -7,6 +8,7 @@ use std::time::Instant;
 pub struct Snapshot {
     pub activity: Vec<DiskActivity>,
     pub devices: Vec<BlockDevice>,
+    pub filesystems: Vec<FilesystemUsage>,
     pub diagnostics: Vec<String>,
 }
 
@@ -14,6 +16,7 @@ pub struct Snapshot {
 pub struct Sampler {
     diskstats_path: PathBuf,
     sys_block_root: PathBuf,
+    mounts_path: PathBuf,
     previous_diskstats: Vec<DiskStat>,
     previous_at: Option<Instant>,
 }
@@ -23,6 +26,7 @@ impl Default for Sampler {
         Self {
             diskstats_path: PathBuf::from("/proc/diskstats"),
             sys_block_root: PathBuf::from("/sys/block"),
+            mounts_path: PathBuf::from("/proc/mounts"),
             previous_diskstats: Vec::new(),
             previous_at: None,
         }
@@ -38,6 +42,7 @@ impl Sampler {
         Self {
             diskstats_path,
             sys_block_root,
+            mounts_path: PathBuf::from("/proc/mounts"),
             previous_diskstats: Vec::new(),
             previous_at: None,
         }
@@ -63,6 +68,7 @@ impl Sampler {
         Snapshot {
             activity,
             devices: collect_block_devices(&self.sys_block_root),
+            filesystems: collect_filesystems(&self.mounts_path),
             diagnostics: Vec::new(),
         }
     }
