@@ -1,3 +1,4 @@
+pub mod block;
 pub mod cli;
 pub mod diskstats;
 pub mod render;
