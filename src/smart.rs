@@ -34,8 +34,8 @@ pub fn parse_smartctl(device: &str, input: &str) -> SmartHealth {
             health.power_on_hours = last_integer(trimmed).or(health.power_on_hours);
         }
 
-        if is_wearout_line(trimmed) {
-            health.wearout_percent = last_integer(trimmed).or(health.wearout_percent);
+        if let Some(wearout_percent) = parse_wearout_percent(trimmed) {
+            health.wearout_percent = Some(wearout_percent);
         }
     }
 
@@ -86,13 +86,23 @@ fn parse_temperature_celsius(line: &str) -> Option<u64> {
     last_integer(current_value)
 }
 
-fn is_wearout_line(line: &str) -> bool {
+fn parse_wearout_percent(line: &str) -> Option<u64> {
     let lower = line.to_ascii_lowercase();
-    lower.contains("wear")
-        || lower.contains("media_wearout")
-        || lower.contains("percent_lifetime")
-        || lower.contains("percentage_used")
-        || lower.contains("percentage used")
+
+    if lower.contains("percentage used") || lower.contains("percentage_used") {
+        return last_integer(line);
+    }
+
+    if lower.contains("percent_lifetime") || lower.contains("lifetime") && lower.contains("remain")
+    {
+        return last_integer(line).map(remaining_to_used_percent);
+    }
+
+    if lower.contains("media_wearout_indicator") || lower.contains("wear_leveling_count") {
+        return smart_attribute_value(line).map(remaining_to_used_percent);
+    }
+
+    None
 }
 
 fn should_collect_device(device: &BlockDevice) -> bool {
@@ -104,11 +114,40 @@ fn should_collect_device(device: &BlockDevice) -> bool {
 }
 
 fn last_integer(input: &str) -> Option<u64> {
-    input
+    let normalized = normalize_grouped_digits(input);
+    normalized
         .split(|character: char| !character.is_ascii_digit())
         .filter(|value| !value.is_empty())
         .filter_map(|value| value.parse().ok())
         .next_back()
+}
+
+fn smart_attribute_value(line: &str) -> Option<u64> {
+    line.split_whitespace().nth(3)?.parse().ok()
+}
+
+fn remaining_to_used_percent(remaining: u64) -> u64 {
+    100_u64.saturating_sub(remaining)
+}
+
+fn normalize_grouped_digits(input: &str) -> String {
+    let characters: Vec<_> = input.chars().collect();
+    let mut normalized = String::with_capacity(input.len());
+
+    for (index, character) in characters.iter().enumerate() {
+        if *character == ','
+            && index > 0
+            && index + 1 < characters.len()
+            && characters[index - 1].is_ascii_digit()
+            && characters[index + 1].is_ascii_digit()
+        {
+            continue;
+        }
+
+        normalized.push(*character);
+    }
+
+    normalized
 }
 
 #[cfg(test)]
@@ -150,5 +189,41 @@ mod tests {
         let health = parse_smartctl("/dev/sda", input);
 
         assert_eq!(health.wearout_percent, Some(4));
+    }
+
+    #[test]
+    fn parses_comma_formatted_power_on_hours() {
+        let input = "Power On Hours: 1,234\n";
+
+        let health = parse_smartctl("/dev/sda", input);
+
+        assert_eq!(health.power_on_hours, Some(1234));
+    }
+
+    #[test]
+    fn parses_media_wearout_indicator_as_used_percent() {
+        let input = "233 Media_Wearout_Indicator 0x0032   091   091   000    Old_age   Always       -       12345\n";
+
+        let health = parse_smartctl("/dev/sda", input);
+
+        assert_eq!(health.wearout_percent, Some(9));
+    }
+
+    #[test]
+    fn parses_lifetime_remaining_as_used_percent() {
+        let input = "Percent_Lifetime_Remain: 87%\n";
+
+        let health = parse_smartctl("/dev/sda", input);
+
+        assert_eq!(health.wearout_percent, Some(13));
+    }
+
+    #[test]
+    fn parses_wear_leveling_count_from_value_column_not_raw() {
+        let input = "177 Wear_Leveling_Count     0x0013   080   080   010    Pre-fail  Always       -       999\n";
+
+        let health = parse_smartctl("/dev/sda", input);
+
+        assert_eq!(health.wearout_percent, Some(20));
     }
 }

@@ -101,4 +101,20 @@ mod tests {
         assert_eq!(arrays[0].level.as_deref(), Some("raid1"));
         assert_eq!(arrays[0].status.as_deref(), Some("[UU]"));
     }
+
+    #[test]
+    fn parses_mdadm_detail_scan_lines() {
+        let input =
+            "\nARRAY /dev/md0 metadata=1.2 UUID=abc name=host:0\n\nARRAY /dev/md1 UUID=def\n";
+
+        let lines = parse_mdadm_detail_scan(input);
+
+        assert_eq!(
+            lines,
+            [
+                "ARRAY /dev/md0 metadata=1.2 UUID=abc name=host:0",
+                "ARRAY /dev/md1 UUID=def"
+            ]
+        );
+    }
 }
