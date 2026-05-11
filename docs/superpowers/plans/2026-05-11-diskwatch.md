@@ -563,10 +563,10 @@ Implement `pub fn run_optional(program: &str, args: &[&str], timeout: Duration) 
 
 Implementation requirements:
 
-- Check PATH first with a small `find_in_path(program)` helper.
-- Use `Command::new(program).args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()`.
+- Resolve commands from standard local system directories with a small `find_in_path(program)` helper; do not scan arbitrary `PATH` entries in the sampler.
+- Use the resolved executable path with `Command::new(path).args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()`.
 - Poll `try_wait()` until timeout.
-- Kill and wait on timeout.
+- Kill on timeout and use bounded child reaping with a background fallback rather than an unbounded blocking wait.
 - Return stdout on success.
 - Return concise diagnostics for not found, non-zero exit, spawn failure, UTF-8 conversion failure, and timeout.
 
@@ -723,7 +723,7 @@ Implement `parse_smartctl(device: &str, input: &str) -> SmartHealth`. Keep parsi
 - Power-on-hours lines capture the last integer.
 - Wearout/lifetime lines capture the last integer when attribute names contain `Wear`, `Media_Wearout`, `Percent_Lifetime`, or `Percentage_Used`.
 
-Implement `collect(devices: &[BlockDevice], timeout: Duration) -> (Vec<SmartHealth>, Vec<String>)` by running `smartctl -A -H /dev/<name>` for non-loop top-level block devices.
+Implement `collect(devices: &[BlockDevice], timeout: Duration) -> (Vec<SmartHealth>, Vec<String>)` by running `smartctl -A -H /dev/<name>` for common physical disk names such as `sd*`, `hd*`, `nvme*`, and `mmcblk*`; skip logical and virtual names such as `dm-*`, `vda`, `xvda`, `nbd*`, `rbd*`, and `zd*`.
 
 - [ ] **Step 7: Run tests**
 

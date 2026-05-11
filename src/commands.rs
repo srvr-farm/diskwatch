@@ -1,4 +1,3 @@
-use std::env;
 use std::io::{self, ErrorKind, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
@@ -12,6 +11,15 @@ const COMMAND_OUTPUT_LIMIT: usize = 1024 * 1024;
 const STDERR_DIAGNOSTIC_LIMIT: usize = 512;
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_millis(25);
 const CHILD_REAP_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const COMMAND_SEARCH_DIRS: &[&str] = &[
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+    "/snap/bin",
+];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OptionalCommandOutput {
@@ -60,14 +68,14 @@ pub fn run_optional_budgeted(
 }
 
 pub fn run_optional(program: &str, args: &[&str], timeout: Duration) -> OptionalCommandOutput {
-    if find_in_path(program).is_none() {
+    let Some(program_path) = find_in_path(program) else {
         return OptionalCommandOutput {
             output: None,
             diagnostic: Some(format!("{program} not found")),
         };
-    }
+    };
 
-    let mut command = Command::new(program);
+    let mut command = Command::new(&program_path);
     command
         .args(args)
         .stdout(Stdio::piped())
@@ -418,11 +426,10 @@ fn find_in_path(program: &str) -> Option<PathBuf> {
         return is_executable_file(path).then(|| path.to_path_buf());
     }
 
-    env::var_os("PATH").and_then(|paths| {
-        env::split_paths(&paths)
-            .map(|directory| directory.join(program))
-            .find(|candidate| is_executable_file(candidate))
-    })
+    COMMAND_SEARCH_DIRS
+        .iter()
+        .map(|directory| Path::new(directory).join(program))
+        .find(|candidate| is_executable_file(candidate))
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -721,5 +728,19 @@ mod tests {
             .diagnostic
             .as_deref()
             .is_some_and(|diagnostic| diagnostic.contains("not found")));
+    }
+
+    #[test]
+    fn bare_command_lookup_ignores_arbitrary_local_directories() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let program = temp.path().join("diskwatch-local-helper");
+        let mut file = std::fs::File::create(&program).unwrap();
+        writeln!(file, "#!/bin/sh").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(find_in_path("diskwatch-local-helper").is_none());
     }
 }

@@ -174,8 +174,17 @@ fn parse_wearout_percent(line: &str) -> Option<u64> {
 }
 
 fn should_collect_device(device: &BlockDevice) -> bool {
-    !device.name.starts_with("loop")
-        && matches!(device.device_type.as_str(), "disk" | "nvme" | "mmc" | "zbc")
+    match device.device_type.as_str() {
+        "disk" => is_smart_disk_name(&device.name),
+        "nvme" => device.name.starts_with("nvme"),
+        "mmc" => device.name.starts_with("mmcblk"),
+        "zbc" => true,
+        _ => false,
+    }
+}
+
+fn is_smart_disk_name(name: &str) -> bool {
+    name.starts_with("sd") || name.starts_with("hd")
 }
 
 fn last_integer(input: &str) -> Option<u64> {
@@ -389,5 +398,19 @@ mod tests {
             .collect();
 
         assert_eq!(names, ["sda", "nvme0n1"]);
+    }
+
+    #[test]
+    fn smart_candidates_skip_virtual_disk_names_even_when_inferred_as_disk() {
+        let devices = ["vda", "xvda", "nbd0", "rbd0", "zd0"]
+            .into_iter()
+            .map(|name| BlockDevice {
+                name: name.to_string(),
+                device_type: "disk".to_string(),
+                ..BlockDevice::default()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(collectable_devices(&devices).is_empty());
     }
 }

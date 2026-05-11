@@ -17,6 +17,7 @@ const SKIPPED_FS_TYPES: &[&str] = &[
     "debugfs",
     "configfs",
     "fusectl",
+    "fuseblk",
     "mqueue",
     "hugetlbfs",
     "autofs",
@@ -146,10 +147,19 @@ pub fn collect(mounts_path: &Path) -> Vec<FilesystemUsage> {
 fn should_skip_mount(mount: &Mount) -> bool {
     SKIPPED_FS_TYPES.contains(&mount.fs_type.as_str())
         || is_blocking_prone_filesystem(&mount.fs_type)
+        || is_remote_source(&mount.source)
 }
 
 fn is_blocking_prone_filesystem(fs_type: &str) -> bool {
     BLOCKING_PRONE_FS_TYPES.contains(&fs_type) || fs_type == "fuse" || fs_type.starts_with("fuse.")
+}
+
+fn is_remote_source(source: &str) -> bool {
+    source.starts_with("//")
+        || source.starts_with("sshfs#")
+        || source
+            .split_once(':')
+            .is_some_and(|(prefix, _)| !prefix.starts_with('/'))
 }
 
 fn unescape_mount_field(value: &str) -> String {
@@ -277,13 +287,24 @@ mod tests {
         let mounts_path = mounts.path().join("mounts");
         std::fs::write(
             &mounts_path,
-            "server:/share /mnt/nfs nfs rw 0 0\n//server/share /mnt/cifs cifs rw 0 0\nsshfs#host:/data /mnt/sshfs fuse.sshfs rw 0 0\n",
+            "server:/share /mnt/nfs nfs rw 0 0\n//server/share /mnt/cifs cifs rw 0 0\nsshfs#host:/data /mnt/sshfs fuse.sshfs rw 0 0\n/dev/sdb1 /mnt/fuseblk fuseblk rw 0 0\nhost:/unknown /mnt/unknown customfs rw 0 0\n",
         )
         .unwrap();
 
         let filesystems = collect(&mounts_path);
 
         assert!(filesystems.is_empty());
+    }
+
+    #[test]
+    fn skips_remote_source_patterns_even_for_unknown_filesystem_types() {
+        let mount = Mount {
+            source: "host:/unknown".to_string(),
+            mountpoint: "/mnt/unknown".to_string(),
+            fs_type: "customfs".to_string(),
+        };
+
+        assert!(should_skip_mount(&mount));
     }
 
     #[test]

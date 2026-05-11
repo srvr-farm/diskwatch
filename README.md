@@ -121,8 +121,9 @@ On Fedora-style systems:
 sudo dnf install make libcap zfs-fuse mdadm lvm2 smartmontools
 ```
 
-Distribution package names vary. If `setcap`, `getcap`, `zpool`, `mdadm`, LVM
-tools, or `smartctl` are not in `PATH`, install the package that provides them
+Distribution package names vary. Optional storage tools are discovered in
+standard local system command directories such as `/usr/bin`, `/usr/sbin`,
+`/usr/local/bin`, and `/usr/local/sbin`; install the package that provides them
 for your distribution.
 
 ## Building
@@ -362,7 +363,10 @@ SMART health uses `smartctl`:
 smartctl -H /dev/sda
 ```
 
-Device names vary by host. Some drives, USB adapters, NVMe devices, and RAID
+Device names vary by host. `diskwatch` probes common physical disk names such as
+`sd*`, `hd*`, `nvme*`, and `mmcblk*`; it skips logical and virtual devices such
+as `dm-*`, `vda`, `xvda`, `nbd*`, `rbd*`, and `zd*` so they do not consume the
+optional command budget. Some drives, USB adapters, NVMe devices, and RAID
 controllers require different `smartctl` options or elevated privileges. The
 monitor reports missing or unreadable SMART data as `N/A` rather than failing.
 

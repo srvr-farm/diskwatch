@@ -161,7 +161,7 @@ fn write_activity_lines(output: &mut String, snapshot: &Snapshot, indent: &str) 
         return;
     }
 
-    for activity in &snapshot.activity {
+    for activity in ordered_activities(snapshot) {
         writeln!(
             output,
             "{indent}{:<12} read={} write={} riops={} wiops={} busy={}",
@@ -182,7 +182,7 @@ fn write_filesystem_lines(output: &mut String, snapshot: &Snapshot, indent: &str
         return;
     }
 
-    for filesystem in &snapshot.filesystems {
+    for filesystem in ordered_filesystems(snapshot) {
         writeln!(
             output,
             "{indent}{} on {} ({}) used={} total={} avail={} use={}",
@@ -204,7 +204,7 @@ fn write_device_lines(output: &mut String, snapshot: &Snapshot, indent: &str) {
         return;
     }
 
-    for device in &snapshot.devices {
+    for device in ordered_devices(snapshot) {
         let rotational = device
             .rotational
             .map(|value| if value { "yes" } else { "no" })
@@ -229,6 +229,62 @@ fn write_device_lines(output: &mut String, snapshot: &Snapshot, indent: &str) {
             format_optional(device.serial.as_deref())
         )
         .unwrap();
+    }
+}
+
+fn ordered_activities(snapshot: &Snapshot) -> Vec<&crate::diskstats::DiskActivity> {
+    let mut activity = snapshot.activity.iter().collect::<Vec<_>>();
+    activity.sort_by_key(|activity| {
+        (
+            storage_name_priority(&activity.name),
+            activity.name.as_str(),
+        )
+    });
+    activity
+}
+
+fn ordered_filesystems(snapshot: &Snapshot) -> Vec<&crate::filesystems::FilesystemUsage> {
+    let mut filesystems = snapshot.filesystems.iter().collect::<Vec<_>>();
+    filesystems.sort_by_key(|filesystem| {
+        (
+            filesystem_priority(filesystem),
+            filesystem.source.as_str(),
+            filesystem.mountpoint.as_str(),
+        )
+    });
+    filesystems
+}
+
+fn ordered_devices(snapshot: &Snapshot) -> Vec<&crate::block::BlockDevice> {
+    let mut devices = snapshot.devices.iter().collect::<Vec<_>>();
+    devices.sort_by_key(|device| (device_priority(device), device.name.as_str()));
+    devices
+}
+
+fn device_priority(device: &crate::block::BlockDevice) -> u8 {
+    match device.device_type.as_str() {
+        "disk" | "nvme" | "mmc" | "zbc" => 0,
+        "md" | "dm" => 1,
+        "loop" | "ram" => 30,
+        _ => 10,
+    }
+}
+
+fn filesystem_priority(filesystem: &crate::filesystems::FilesystemUsage) -> u8 {
+    if filesystem.source.starts_with("/dev/loop") || filesystem.fs_type == "squashfs" {
+        30
+    } else if matches!(filesystem.fs_type.as_str(), "tmpfs" | "overlay") {
+        20
+    } else {
+        0
+    }
+}
+
+fn storage_name_priority(name: &str) -> u8 {
+    if name.starts_with("loop") || name.starts_with("ram") {
+        30
+    } else {
+        0
     }
 }
 
@@ -414,6 +470,9 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::BlockDevice;
+    use crate::diskstats::DiskActivity;
+    use crate::filesystems::FilesystemUsage;
     use crate::raid::MdArray;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -501,6 +560,54 @@ diagnostics:
     fn formats_large_storage_units() {
         assert_eq!(format_bytes(2 * 1024_u64.pow(4)), "2.0 TiB");
         assert_eq!(format_bytes(3 * 1024_u64.pow(5)), "3.0 PiB");
+    }
+
+    #[test]
+    fn text_report_prioritizes_real_storage_over_loop_and_snap_noise() {
+        let snapshot = Snapshot {
+            activity: vec![
+                DiskActivity {
+                    name: "loop0".to_string(),
+                    ..DiskActivity::default()
+                },
+                DiskActivity {
+                    name: "sda".to_string(),
+                    ..DiskActivity::default()
+                },
+            ],
+            filesystems: vec![
+                FilesystemUsage {
+                    source: "/dev/loop0".to_string(),
+                    mountpoint: "/snap/tool".to_string(),
+                    fs_type: "squashfs".to_string(),
+                    ..FilesystemUsage::default()
+                },
+                FilesystemUsage {
+                    source: "/dev/sda1".to_string(),
+                    mountpoint: "/".to_string(),
+                    fs_type: "ext4".to_string(),
+                    ..FilesystemUsage::default()
+                },
+            ],
+            devices: vec![
+                BlockDevice {
+                    name: "loop0".to_string(),
+                    device_type: "loop".to_string(),
+                    ..BlockDevice::default()
+                },
+                BlockDevice {
+                    name: "sda".to_string(),
+                    device_type: "disk".to_string(),
+                    ..BlockDevice::default()
+                },
+            ],
+            ..Snapshot::default()
+        };
+
+        let report = format_text_report(&snapshot);
+
+        assert!(report.find("sda").unwrap() < report.find("loop0").unwrap());
+        assert!(report.find("/dev/sda1").unwrap() < report.find("/dev/loop0").unwrap());
     }
 
     fn render_snapshot(width: u16, height: u16, snapshot: &Snapshot) -> String {
