@@ -49,7 +49,13 @@ impl Default for Sampler {
 
 impl Sampler {
     pub fn new_for_tests(diskstats_path: PathBuf) -> Self {
-        Self::new_for_tests_with_roots(diskstats_path, PathBuf::from("/sys/block"))
+        let hermetic_root = hermetic_test_root(&diskstats_path);
+        Self::new_for_tests_with_paths(
+            diskstats_path,
+            hermetic_root.join("sys/block"),
+            hermetic_root.join("mounts"),
+            hermetic_root.join("mdstat"),
+        )
     }
 
     pub fn new_for_tests_with_paths(
@@ -150,6 +156,18 @@ impl Sampler {
     }
 }
 
+fn hermetic_test_root(diskstats_path: &std::path::Path) -> PathBuf {
+    let parent = diskstats_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let name = diskstats_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "diskstats".into());
+
+    parent.join(format!(".{name}-diskwatch-test"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,7 +208,8 @@ mod tests {
         );
 
         let mut sampler = Sampler::new_for_tests_with_paths(diskstats, sys_block, mounts, mdstat);
-        let first = sampler.sample_at(Instant::now());
+        let started = Instant::now();
+        let first = sampler.sample_at(started);
         assert_eq!(first.devices.len(), 1);
         assert_eq!(first.filesystems.len(), 1);
         assert_eq!(first.filesystems[0].source, "/dev/sda1");
@@ -207,17 +226,16 @@ mod tests {
         assert_eq!(first.lvm, LvmSnapshot::default());
         assert!(first.smart.is_empty());
         assert!(first.diagnostics.is_empty());
-        assert!(first
-            .activity
-            .iter()
-            .all(|device| device.read_bytes_per_sec.is_none()));
+        assert!(first.activity.is_empty());
 
         write(
             &sampler.diskstats_path,
             "8 0 sda 12 0 712 0 9 0 592 0 0 140 150 0 0 0 0 0 0\n",
         );
-        let second = sampler.sample_at(Instant::now() + Duration::from_secs(1));
+        let second = sampler.sample_at(started + Duration::from_secs(1));
         assert_eq!(second.activity[0].name, "sda");
+        assert_eq!(second.activity[0].read_bytes_per_sec, Some(262_144.0));
+        assert_eq!(second.activity[0].write_bytes_per_sec, Some(262_144.0));
         assert_eq!(second.devices[0].name, "sda");
         assert_eq!(second.filesystems[0].source, "/dev/sda1");
         assert_eq!(second.mdraid[0].name, "md0");
@@ -234,6 +252,9 @@ mod tests {
 
         let snapshot = sampler.sample();
 
+        assert!(snapshot.devices.is_empty());
+        assert!(snapshot.filesystems.is_empty());
+        assert!(snapshot.mdraid.is_empty());
         assert!(snapshot.zfs.is_empty());
         assert_eq!(snapshot.lvm, LvmSnapshot::default());
         assert!(snapshot.smart.is_empty());
