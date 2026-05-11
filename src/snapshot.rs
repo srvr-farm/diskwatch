@@ -1,14 +1,24 @@
 use crate::block::{collect as collect_block_devices, BlockDevice};
 use crate::diskstats::{activities_between, read_diskstats, DiskActivity, DiskStat};
 use crate::filesystems::{collect as collect_filesystems, FilesystemUsage};
+use crate::lvm::{self, LvmSnapshot};
+use crate::raid::{read_mdstat, MdArray};
+use crate::smart::{self, SmartHealth};
+use crate::zfs::{self, Zpool};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
     pub activity: Vec<DiskActivity>,
-    pub devices: Vec<BlockDevice>,
     pub filesystems: Vec<FilesystemUsage>,
+    pub devices: Vec<BlockDevice>,
+    pub mdraid: Vec<MdArray>,
+    pub zfs: Vec<Zpool>,
+    pub lvm: LvmSnapshot,
+    pub smart: Vec<SmartHealth>,
     pub diagnostics: Vec<String>,
 }
 
@@ -17,6 +27,8 @@ pub struct Sampler {
     diskstats_path: PathBuf,
     sys_block_root: PathBuf,
     mounts_path: PathBuf,
+    mdstat_path: PathBuf,
+    optional_commands_enabled: bool,
     previous_diskstats: Vec<DiskStat>,
     previous_at: Option<Instant>,
 }
@@ -27,6 +39,8 @@ impl Default for Sampler {
             diskstats_path: PathBuf::from("/proc/diskstats"),
             sys_block_root: PathBuf::from("/sys/block"),
             mounts_path: PathBuf::from("/proc/mounts"),
+            mdstat_path: PathBuf::from("/proc/mdstat"),
+            optional_commands_enabled: true,
             previous_diskstats: Vec::new(),
             previous_at: None,
         }
@@ -34,8 +48,21 @@ impl Default for Sampler {
 }
 
 impl Sampler {
-    pub fn new_for_tests(diskstats_path: PathBuf) -> Self {
-        Self::new_for_tests_with_roots(diskstats_path, PathBuf::from("/sys/block"))
+    pub fn new_for_tests(
+        diskstats_path: PathBuf,
+        sys_block_root: PathBuf,
+        mounts_path: PathBuf,
+        mdstat_path: PathBuf,
+    ) -> Self {
+        Self {
+            diskstats_path,
+            sys_block_root,
+            mounts_path,
+            mdstat_path,
+            optional_commands_enabled: false,
+            previous_diskstats: Vec::new(),
+            previous_at: None,
+        }
     }
 
     pub fn new_for_tests_with_roots(diskstats_path: PathBuf, sys_block_root: PathBuf) -> Self {
@@ -51,17 +78,19 @@ impl Sampler {
         sys_block_root: PathBuf,
         mounts_path: PathBuf,
     ) -> Self {
-        Self {
+        Self::new_for_tests(
             diskstats_path,
             sys_block_root,
             mounts_path,
-            previous_diskstats: Vec::new(),
-            previous_at: None,
-        }
+            PathBuf::from("/nonexistent-diskwatch-test-mdstat"),
+        )
     }
 
     pub fn sample(&mut self) -> Snapshot {
-        let now = Instant::now();
+        self.sample_at(Instant::now())
+    }
+
+    pub fn sample_at(&mut self, now: Instant) -> Snapshot {
         let current_diskstats = read_diskstats(&self.diskstats_path);
         let activity = self
             .previous_at
@@ -74,15 +103,46 @@ impl Sampler {
             })
             .unwrap_or_default();
 
+        let devices = collect_block_devices(&self.sys_block_root);
+        let filesystems = collect_filesystems(&self.mounts_path);
+        let mdraid = read_mdstat(&self.mdstat_path);
+        let (zfs, lvm, smart, diagnostics) = self.collect_optional_commands(&devices);
+
         self.previous_diskstats = current_diskstats;
         self.previous_at = Some(now);
 
         Snapshot {
             activity,
-            devices: collect_block_devices(&self.sys_block_root),
-            filesystems: collect_filesystems(&self.mounts_path),
-            diagnostics: Vec::new(),
+            filesystems,
+            devices,
+            mdraid,
+            zfs,
+            lvm,
+            smart,
+            diagnostics,
         }
+    }
+
+    fn collect_optional_commands(
+        &self,
+        devices: &[BlockDevice],
+    ) -> (Vec<Zpool>, LvmSnapshot, Vec<SmartHealth>, Vec<String>) {
+        if !self.optional_commands_enabled {
+            return (Vec::new(), LvmSnapshot::default(), Vec::new(), Vec::new());
+        }
+
+        let mut diagnostics = Vec::new();
+
+        let (zfs, zfs_diagnostics) = zfs::collect(DEFAULT_COMMAND_TIMEOUT);
+        diagnostics.extend(zfs_diagnostics);
+
+        let (lvm, lvm_diagnostics) = lvm::collect(DEFAULT_COMMAND_TIMEOUT);
+        diagnostics.extend(lvm_diagnostics);
+
+        let (smart, smart_diagnostics) = smart::collect(devices, DEFAULT_COMMAND_TIMEOUT);
+        diagnostics.extend(smart_diagnostics);
+
+        (zfs, lvm, smart, diagnostics)
     }
 }
 
@@ -90,8 +150,49 @@ impl Sampler {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
+    use std::time::Duration;
     use tempfile::NamedTempFile;
     use tempfile::TempDir;
+
+    fn write(path: &Path, value: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, value).unwrap();
+    }
+
+    #[test]
+    fn sampler_combines_storage_snapshots() {
+        let temp = TempDir::new().unwrap();
+        let diskstats = temp.path().join("diskstats");
+        let sys_block = temp.path().join("sys/block");
+        let mounts = temp.path().join("mounts");
+        let mdstat = temp.path().join("mdstat");
+
+        write(
+            &diskstats,
+            "8 0 sda 10 0 200 0 5 0 80 0 0 40 50 0 0 0 0 0 0\n",
+        );
+        write(&sys_block.join("sda/size"), "2097152\n");
+        write(&sys_block.join("sda/queue/rotational"), "1\n");
+        write(&mounts, "tmpfs /tmp tmpfs rw 0 0\n");
+        write(&mdstat, "Personalities : [raid1]\n");
+
+        let mut sampler = Sampler::new_for_tests(diskstats, sys_block, mounts, mdstat);
+        let first = sampler.sample_at(Instant::now());
+        assert_eq!(first.devices.len(), 1);
+        assert!(first
+            .activity
+            .iter()
+            .all(|device| device.read_bytes_per_sec.is_none()));
+
+        write(
+            &sampler.diskstats_path,
+            "8 0 sda 12 0 712 0 9 0 592 0 0 140 150 0 0 0 0 0 0\n",
+        );
+        let second = sampler.sample_at(Instant::now() + Duration::from_secs(1));
+        assert_eq!(second.activity[0].name, "sda");
+        assert_eq!(second.devices[0].name, "sda");
+    }
 
     #[test]
     fn sampler_reports_activity_from_diskstats_deltas() {
