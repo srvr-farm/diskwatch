@@ -366,10 +366,11 @@ smartctl -n standby -A -H /dev/sda
 Device names vary by host. `diskwatch` probes common physical disk names such as
 `sd*`, `hd*`, `nvme*`, and `mmcblk*`; it skips logical and virtual devices such
 as `dm-*`, `vda`, `xvda`, `nbd*`, `rbd*`, and `zd*` so they do not consume the
-optional command budget. The `-n standby` guard avoids waking sleeping disks.
-Some drives, USB adapters, NVMe devices, and RAID controllers require different
-`smartctl` options or elevated privileges. The monitor reports missing, asleep,
-or unreadable SMART data as `N/A` rather than failing.
+optional command budget. The `-n standby` guard reduces the chance of waking
+sleeping disks, but `smartctl` device autodetection can still wake some
+hardware. Some drives, USB adapters, NVMe devices, and RAID controllers require
+different `smartctl` options or elevated privileges. The monitor reports
+missing, asleep, or unreadable SMART data as `N/A` rather than failing.
 
 ### Capabilities
 

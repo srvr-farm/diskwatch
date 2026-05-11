@@ -116,6 +116,8 @@ where
 }
 
 fn smartctl_args(path: &str) -> [&str; 5] {
+    // Best-effort standby guard; smartctl device autodetection can still wake
+    // some hardware unless a safe device type is supplied.
     ["-n", "standby", "-A", "-H", path]
 }
 
