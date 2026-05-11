@@ -3,8 +3,12 @@ pub mod cli;
 pub mod commands;
 pub mod diskstats;
 pub mod filesystems;
+pub mod lvm;
+pub mod raid;
 pub mod render;
+pub mod smart;
 pub mod snapshot;
+pub mod zfs;
 
 use crate::cli::Cli;
 use crate::snapshot::Sampler;
