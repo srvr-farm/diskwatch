@@ -88,7 +88,9 @@ fn parse_temperature_celsius(line: &str) -> Option<u64> {
 
 fn parse_power_on_hours(line: &str) -> Option<u64> {
     if let Some(raw_value) = smart_attribute_raw_value(line) {
-        return first_integer(raw_value);
+        if let Some(hours) = first_integer(raw_value) {
+            return Some(hours);
+        }
     }
 
     last_integer(line)
@@ -142,7 +144,7 @@ fn smart_attribute_value(line: &str) -> Option<u64> {
 }
 
 fn smart_attribute_raw_value(line: &str) -> Option<&str> {
-    line.split_whitespace().nth(8)
+    line.split_whitespace().nth(9)
 }
 
 fn remaining_to_used_percent(remaining: u64) -> u64 {
@@ -229,7 +231,7 @@ mod tests {
 
     #[test]
     fn parses_compound_power_on_hours() {
-        let input = "Power_On_Hours          0x0032   100   100   000    Old_age   Always       -       1234h+56m+00.000s\n";
+        let input = "9 Power_On_Hours 0x0032 099 099 000 Old_age Always - 1234h+56m+00.000s\n";
 
         let health = parse_smartctl("/dev/sda", input);
 
