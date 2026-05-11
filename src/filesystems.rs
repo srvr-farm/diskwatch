@@ -22,6 +22,22 @@ const SKIPPED_FS_TYPES: &[&str] = &[
     "autofs",
 ];
 
+const BLOCKING_PRONE_FS_TYPES: &[&str] = &[
+    "9p",
+    "afpfs",
+    "ceph",
+    "cifs",
+    "davfs",
+    "glusterfs",
+    "lustre",
+    "nfs",
+    "nfs4",
+    "smb3",
+    "smbfs",
+    "sshfs",
+    "virtiofs",
+];
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Mount {
     pub source: String,
@@ -119,12 +135,21 @@ pub fn summarize_mount(mount: &Mount, stats: FsStats) -> FilesystemUsage {
 pub fn collect(mounts_path: &Path) -> Vec<FilesystemUsage> {
     read_mounts(mounts_path)
         .into_iter()
-        .filter(|mount| !SKIPPED_FS_TYPES.contains(&mount.fs_type.as_str()))
+        .filter(|mount| !should_skip_mount(mount))
         .filter_map(|mount| {
             let stats = stat_mount(Path::new(&mount.mountpoint))?;
             Some(summarize_mount(&mount, stats))
         })
         .collect()
+}
+
+fn should_skip_mount(mount: &Mount) -> bool {
+    SKIPPED_FS_TYPES.contains(&mount.fs_type.as_str())
+        || is_blocking_prone_filesystem(&mount.fs_type)
+}
+
+fn is_blocking_prone_filesystem(fs_type: &str) -> bool {
+    BLOCKING_PRONE_FS_TYPES.contains(&fs_type) || fs_type == "fuse" || fs_type.starts_with("fuse.")
 }
 
 fn unescape_mount_field(value: &str) -> String {
@@ -244,6 +269,21 @@ mod tests {
             .map(|filesystem| filesystem.fs_type.as_str())
             .collect();
         assert_eq!(fs_types, ["tmpfs", "overlay"]);
+    }
+
+    #[test]
+    fn collect_skips_remote_and_fuse_mounts_to_avoid_blocking_statvfs() {
+        let mounts = TempDir::new().unwrap();
+        let mounts_path = mounts.path().join("mounts");
+        std::fs::write(
+            &mounts_path,
+            "server:/share /mnt/nfs nfs rw 0 0\n//server/share /mnt/cifs cifs rw 0 0\nsshfs#host:/data /mnt/sshfs fuse.sshfs rw 0 0\n",
+        )
+        .unwrap();
+
+        let filesystems = collect(&mounts_path);
+
+        assert!(filesystems.is_empty());
     }
 
     #[test]

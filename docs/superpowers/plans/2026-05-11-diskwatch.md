@@ -4,7 +4,7 @@
 
 **Goal:** Build `diskwatch`, a read-only Linux storage monitor TUI and one-shot report tool matching the `cpuwatch` and `memwatch` workflow, packaging, and release pipeline.
 
-**Architecture:** Implement a Rust crate shaped like the sibling watch tools: shared CLI/TUI loop in `lib.rs`, snapshot orchestration in `snapshot.rs`, focused storage collectors, and text/TUI rendering in `render.rs`. Baseline collectors read `/proc` and `/sys`; optional command collectors use short timeout-bound read-only commands under an aggregate refresh budget and degrade to `N/A` plus diagnostics.
+**Architecture:** Implement a Rust crate shaped like the sibling watch tools: shared CLI/TUI loop in `lib.rs`, snapshot orchestration in `snapshot.rs`, focused storage collectors, and text/TUI rendering in `render.rs`. Baseline collectors read `/proc` and `/sys`; filesystem capacity uses local `statvfs` while skipping remote/FUSE mounts that can hang; optional command collectors use short timeout-bound read-only commands under an aggregate refresh budget and degrade to `N/A` plus diagnostics.
 
 **Tech Stack:** Rust 2021, `ratatui`, `crossterm`, `clap`, `humantime`, `anyhow`, `libc`, Makefile packaging, Woodpecker CI, Debian/RPM package templates.
 

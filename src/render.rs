@@ -360,8 +360,17 @@ fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
     const GIB: f64 = MIB * 1024.0;
+    const TIB: f64 = GIB * 1024.0;
+    const PIB: f64 = TIB * 1024.0;
+    const EIB: f64 = PIB * 1024.0;
     let bytes = bytes as f64;
-    if bytes >= GIB {
+    if bytes >= EIB {
+        format!("{:.1} EiB", bytes / EIB)
+    } else if bytes >= PIB {
+        format!("{:.1} PiB", bytes / PIB)
+    } else if bytes >= TIB {
+        format!("{:.1} TiB", bytes / TIB)
+    } else if bytes >= GIB {
         format!("{:.1} GiB", bytes / GIB)
     } else if bytes >= MIB {
         format!("{:.1} MiB", bytes / MIB)
@@ -486,6 +495,12 @@ diagnostics:
     #[test]
     fn draw_does_not_panic_on_small_terminal() {
         let _output = render_snapshot(32, 8, &Snapshot::default());
+    }
+
+    #[test]
+    fn formats_large_storage_units() {
+        assert_eq!(format_bytes(2 * 1024_u64.pow(4)), "2.0 TiB");
+        assert_eq!(format_bytes(3 * 1024_u64.pow(5)), "3.0 PiB");
     }
 
     fn render_snapshot(width: u16, height: u16, snapshot: &Snapshot) -> String {

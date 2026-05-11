@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 const COMMAND_OUTPUT_LIMIT: usize = 1024 * 1024;
 const STDERR_DIAGNOSTIC_LIMIT: usize = 512;
+const CHILD_REAP_TIMEOUT: Duration = Duration::from_millis(25);
+const CHILD_REAP_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OptionalCommandOutput {
@@ -99,8 +101,7 @@ pub fn run_optional(program: &str, args: &[&str], timeout: Duration) -> Optional
         match CommandOutputReaders::new(child.stdout.take(), child.stderr.take(), program) {
             Ok(output) => output,
             Err(diagnostic) => {
-                kill_process_group(process_group);
-                let _ = child.wait();
+                finish_child_after_kill(child, process_group);
                 return OptionalCommandOutput {
                     output: None,
                     diagnostic: Some(diagnostic),
@@ -115,8 +116,7 @@ pub fn run_optional(program: &str, args: &[&str], timeout: Duration) -> Optional
     let started = Instant::now();
     loop {
         if let Err(diagnostic) = output.drain(program) {
-            kill_process_group(process_group);
-            let _ = child.wait();
+            finish_child_after_kill(child, process_group);
             return OptionalCommandOutput {
                 output: None,
                 diagnostic: Some(diagnostic),
@@ -140,8 +140,7 @@ pub fn run_optional(program: &str, args: &[&str], timeout: Duration) -> Optional
             }
             Ok(None) => thread::sleep(poll_interval(started, timeout)),
             Err(error) => {
-                kill_process_group(process_group);
-                let _ = child.wait();
+                finish_child_after_kill(child, process_group);
                 return OptionalCommandOutput {
                     output: None,
                     diagnostic: Some(format!("failed while waiting for {program}: {error}")),
@@ -334,17 +333,45 @@ fn exit_diagnostic(program: &str, status: ExitStatus, stderr: &[u8]) -> String {
 
 fn timeout_result(
     program: &str,
-    mut child: Child,
+    child: Child,
     process_group: ProcessGroup,
     mut output: CommandOutputReaders,
     timeout: Duration,
 ) -> OptionalCommandOutput {
-    kill_process_group(process_group);
-    let _ = child.wait();
+    finish_child_after_kill(child, process_group);
     let _ = output.drain(program);
     OptionalCommandOutput {
         output: None,
         diagnostic: Some(format!("{program} timed out after {timeout:?}")),
+    }
+}
+
+fn finish_child_after_kill(mut child: Child, process_group: ProcessGroup) {
+    kill_process_group(process_group);
+    if reap_child_until(&mut child, CHILD_REAP_TIMEOUT) {
+        return;
+    }
+
+    let _ = thread::Builder::new()
+        .name("diskwatch-command-reaper".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
+fn reap_child_until(child: &mut Child, timeout: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) if started.elapsed() >= timeout => return false,
+            Ok(None) => thread::sleep(
+                timeout
+                    .checked_sub(started.elapsed())
+                    .unwrap_or(Duration::ZERO)
+                    .min(CHILD_REAP_POLL_INTERVAL),
+            ),
+        }
     }
 }
 
@@ -476,6 +503,23 @@ mod tests {
                 .is_some_and(|diagnostic| diagnostic.contains("timed out")),
             "expected timeout diagnostic, got {:?}",
             result.diagnostic
+        );
+    }
+
+    #[test]
+    fn killed_child_reap_is_bounded_when_child_has_not_exited() {
+        let mut child = Command::new("sh").arg("-c").arg("sleep 1").spawn().unwrap();
+        let started = Instant::now();
+
+        let reaped = reap_child_until(&mut child, Duration::from_millis(25));
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(!reaped);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "bounded reap waited too long: {:?}",
+            started.elapsed()
         );
     }
 

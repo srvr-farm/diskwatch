@@ -16,7 +16,8 @@ Use `diskwatch` when you want to:
   and busy percentage from Linux disk statistics.
 - Inspect mounted filesystem capacity, including used, available, total, and
   percent used. Kernel pseudo filesystems are filtered, while capacity-bearing
-  mounts such as container overlay roots and tmpfs mounts are retained.
+  mounts such as container overlay roots and tmpfs mounts are retained. Remote
+  and FUSE mounts are skipped to avoid blocking on stale network filesystems.
 - Inspect block-device inventory, including size, type, rotational hint, logical
   and physical sector size, vendor, model, and serial where readable.
 - Check ZFS pool capacity and health when `zpool` is installed.
@@ -86,6 +87,10 @@ a short aggregate budget so slower tools such as `zpool`, `mdadm`, LVM commands,
 or per-device `smartctl` checks cannot multiply into long UI stalls. Core
 activity, filesystem, block-device, and `/proc/mdstat` data are still refreshed
 on the normal interval.
+
+Mounted filesystem capacity uses synchronous local `statvfs` calls. Remote and
+FUSE filesystem types such as NFS, CIFS, sshfs, and similar mounts are skipped
+so a stale mount cannot freeze the monitor.
 
 ## Prerequisites
 
