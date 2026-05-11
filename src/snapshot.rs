@@ -48,7 +48,11 @@ impl Default for Sampler {
 }
 
 impl Sampler {
-    pub fn new_for_tests(
+    pub fn new_for_tests(diskstats_path: PathBuf) -> Self {
+        Self::new_for_tests_with_roots(diskstats_path, PathBuf::from("/sys/block"))
+    }
+
+    pub fn new_for_tests_with_paths(
         diskstats_path: PathBuf,
         sys_block_root: PathBuf,
         mounts_path: PathBuf,
@@ -78,7 +82,7 @@ impl Sampler {
         sys_block_root: PathBuf,
         mounts_path: PathBuf,
     ) -> Self {
-        Self::new_for_tests(
+        Self::new_for_tests_with_paths(
             diskstats_path,
             sys_block_root,
             mounts_path,
@@ -167,6 +171,7 @@ mod tests {
         let sys_block = temp.path().join("sys/block");
         let mounts = temp.path().join("mounts");
         let mdstat = temp.path().join("mdstat");
+        let mountpoint = temp.path().join("mnt/data");
 
         write(
             &diskstats,
@@ -174,12 +179,34 @@ mod tests {
         );
         write(&sys_block.join("sda/size"), "2097152\n");
         write(&sys_block.join("sda/queue/rotational"), "1\n");
-        write(&mounts, "tmpfs /tmp tmpfs rw 0 0\n");
-        write(&mdstat, "Personalities : [raid1]\n");
+        fs::create_dir_all(&mountpoint).unwrap();
+        write(
+            &mounts,
+            &format!("/dev/sda1 {} ext4 rw 0 0\n", mountpoint.display()),
+        );
+        write(
+            &mdstat,
+            "Personalities : [raid1]\nmd0 : active raid1 sdb1[1] sda1[0]\n      1046528 blocks super 1.2 [2/2] [UU]\n",
+        );
 
-        let mut sampler = Sampler::new_for_tests(diskstats, sys_block, mounts, mdstat);
+        let mut sampler = Sampler::new_for_tests_with_paths(diskstats, sys_block, mounts, mdstat);
         let first = sampler.sample_at(Instant::now());
         assert_eq!(first.devices.len(), 1);
+        assert_eq!(first.filesystems.len(), 1);
+        assert_eq!(first.filesystems[0].source, "/dev/sda1");
+        assert_eq!(
+            first.filesystems[0].mountpoint,
+            mountpoint.display().to_string()
+        );
+        assert_eq!(first.filesystems[0].fs_type, "ext4");
+        assert_eq!(first.mdraid.len(), 1);
+        assert_eq!(first.mdraid[0].name, "md0");
+        assert_eq!(first.mdraid[0].level.as_deref(), Some("raid1"));
+        assert_eq!(first.mdraid[0].status.as_deref(), Some("[UU]"));
+        assert!(first.zfs.is_empty());
+        assert_eq!(first.lvm, LvmSnapshot::default());
+        assert!(first.smart.is_empty());
+        assert!(first.diagnostics.is_empty());
         assert!(first
             .activity
             .iter()
@@ -192,6 +219,25 @@ mod tests {
         let second = sampler.sample_at(Instant::now() + Duration::from_secs(1));
         assert_eq!(second.activity[0].name, "sda");
         assert_eq!(second.devices[0].name, "sda");
+        assert_eq!(second.filesystems[0].source, "/dev/sda1");
+        assert_eq!(second.mdraid[0].name, "md0");
+        assert!(second.zfs.is_empty());
+        assert_eq!(second.lvm, LvmSnapshot::default());
+        assert!(second.smart.is_empty());
+        assert!(second.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn one_path_test_constructor_keeps_optional_commands_disabled() {
+        let diskstats = NamedTempFile::new().unwrap();
+        let mut sampler = Sampler::new_for_tests(diskstats.path().to_path_buf());
+
+        let snapshot = sampler.sample();
+
+        assert!(snapshot.zfs.is_empty());
+        assert_eq!(snapshot.lvm, LvmSnapshot::default());
+        assert!(snapshot.smart.is_empty());
+        assert!(snapshot.diagnostics.is_empty());
     }
 
     #[test]
