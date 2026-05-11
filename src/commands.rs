@@ -4,6 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -68,6 +69,10 @@ pub fn run_optional_budgeted(
 }
 
 pub fn run_optional(program: &str, args: &[&str], timeout: Duration) -> OptionalCommandOutput {
+    if program_has_unreaped_child(program) {
+        return unreaped_child_result(program);
+    }
+
     let Some(program_path) = find_in_path(program) else {
         return OptionalCommandOutput {
             output: None,
@@ -109,7 +114,7 @@ pub fn run_optional(program: &str, args: &[&str], timeout: Duration) -> Optional
         match CommandOutputReaders::new(child.stdout.take(), child.stderr.take(), program) {
             Ok(output) => output,
             Err(diagnostic) => {
-                finish_child_after_kill(child, process_group);
+                finish_child_after_kill(program, child, process_group);
                 return OptionalCommandOutput {
                     output: None,
                     diagnostic: Some(diagnostic),
@@ -124,7 +129,7 @@ pub fn run_optional(program: &str, args: &[&str], timeout: Duration) -> Optional
     let started = Instant::now();
     loop {
         if let Err(diagnostic) = output.drain(program) {
-            finish_child_after_kill(child, process_group);
+            finish_child_after_kill(program, child, process_group);
             return OptionalCommandOutput {
                 output: None,
                 diagnostic: Some(diagnostic),
@@ -148,7 +153,7 @@ pub fn run_optional(program: &str, args: &[&str], timeout: Duration) -> Optional
             }
             Ok(None) => thread::sleep(poll_interval(started, timeout)),
             Err(error) => {
-                finish_child_after_kill(child, process_group);
+                finish_child_after_kill(program, child, process_group);
                 return OptionalCommandOutput {
                     output: None,
                     diagnostic: Some(format!("failed while waiting for {program}: {error}")),
@@ -346,7 +351,7 @@ fn timeout_result(
     mut output: CommandOutputReaders,
     timeout: Duration,
 ) -> OptionalCommandOutput {
-    finish_child_after_kill(child, process_group);
+    finish_child_after_kill(program, child, process_group);
     let _ = output.drain(program);
     OptionalCommandOutput {
         output: None,
@@ -354,17 +359,55 @@ fn timeout_result(
     }
 }
 
-fn finish_child_after_kill(mut child: Child, process_group: ProcessGroup) {
+struct DeferredChild {
+    program: String,
+    child: Child,
+}
+
+static DEFERRED_CHILDREN: OnceLock<Mutex<Vec<DeferredChild>>> = OnceLock::new();
+
+fn deferred_children() -> &'static Mutex<Vec<DeferredChild>> {
+    DEFERRED_CHILDREN.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn finish_child_after_kill(program: &str, mut child: Child, process_group: ProcessGroup) {
     kill_process_group(process_group);
     if reap_child_until(&mut child, CHILD_REAP_TIMEOUT) {
         return;
     }
 
-    let _ = thread::Builder::new()
-        .name("diskwatch-command-reaper".to_string())
-        .spawn(move || {
-            let _ = child.wait();
+    defer_child_reap(program, child);
+}
+
+fn defer_child_reap(program: &str, child: Child) {
+    if let Ok(mut children) = deferred_children().lock() {
+        children.push(DeferredChild {
+            program: program.to_string(),
+            child,
         });
+    }
+}
+
+fn program_has_unreaped_child(program: &str) -> bool {
+    reap_deferred_children();
+    deferred_children()
+        .lock()
+        .is_ok_and(|children| children.iter().any(|child| child.program == program))
+}
+
+fn unreaped_child_result(program: &str) -> OptionalCommandOutput {
+    OptionalCommandOutput {
+        output: None,
+        diagnostic: Some(format!(
+            "{program} previous timed-out process has not exited; skipping"
+        )),
+    }
+}
+
+fn reap_deferred_children() {
+    if let Ok(mut children) = deferred_children().lock() {
+        children.retain_mut(|entry| matches!(entry.child.try_wait(), Ok(None)));
+    }
 }
 
 fn reap_child_until(child: &mut Child, timeout: Duration) -> bool {
@@ -528,6 +571,19 @@ mod tests {
             "bounded reap waited too long: {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn unreaped_child_suppresses_retry_for_same_program() {
+        let child = Command::new("sh").arg("-c").arg("sleep 1").spawn().unwrap();
+        defer_child_reap("diskwatch-test-unreaped", child);
+
+        let result = unreaped_child_result("diskwatch-test-unreaped");
+
+        assert!(result
+            .diagnostic
+            .as_deref()
+            .is_some_and(|diagnostic| diagnostic.contains("previous timed-out process")));
     }
 
     #[test]

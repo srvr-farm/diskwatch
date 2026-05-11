@@ -16,6 +16,9 @@ const SKIPPED_FS_TYPES: &[&str] = &[
     "tracefs",
     "debugfs",
     "configfs",
+    "binfmt_misc",
+    "efivarfs",
+    "nsfs",
     "fusectl",
     "fuseblk",
     "mqueue",
@@ -264,7 +267,10 @@ mod tests {
         std::fs::write(
             &mounts_path,
             format!(
-                "proc {} proc rw 0 0\ntmpfs {} tmpfs rw 0 0\noverlay {} overlay rw 0 0\n",
+                "proc {} proc rw 0 0\nbinfmt_misc {} binfmt_misc rw 0 0\nefivarfs {} efivarfs rw 0 0\nnsfs {} nsfs rw 0 0\ntmpfs {} tmpfs rw 0 0\noverlay {} overlay rw 0 0\n",
+                mountpoint.path().display(),
+                mountpoint.path().display(),
+                mountpoint.path().display(),
                 mountpoint.path().display(),
                 mountpoint.path().display(),
                 mountpoint.path().display()

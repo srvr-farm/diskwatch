@@ -100,18 +100,31 @@ where
 
     for device in devices {
         let path = format!("/dev/{}", device.name);
-        let Some(result) = run("smartctl", &["-A", "-H", &path]) else {
+        let args = smartctl_args(&path);
+        let Some(result) = run("smartctl", &args) else {
             break;
         };
         if let Some(output) = result.output {
             health.push(parse_smartctl(&path, &output));
         }
         if let Some(diagnostic) = result.diagnostic {
-            diagnostics.push(format!("{path}: {diagnostic}"));
+            diagnostics.push(format_smart_diagnostic(&path, &diagnostic));
         }
     }
 
     (health, diagnostics)
+}
+
+fn smartctl_args(path: &str) -> [&str; 5] {
+    ["-n", "standby", "-A", "-H", path]
+}
+
+fn format_smart_diagnostic(path: &str, diagnostic: &str) -> String {
+    if diagnostic.to_ascii_lowercase().contains("standby") {
+        format!("{path}: SMART skipped because device is in standby")
+    } else {
+        format!("{path}: {diagnostic}")
+    }
 }
 
 fn parse_health_status(line: &str) -> Option<String> {
@@ -370,6 +383,41 @@ mod tests {
 
         assert!(health.is_empty());
         assert_eq!(diagnostics, ["smartctl not found"]);
+    }
+
+    #[test]
+    fn smartctl_args_include_standby_guard() {
+        assert_eq!(
+            smartctl_args("/dev/sda"),
+            ["-n", "standby", "-A", "-H", "/dev/sda"]
+        );
+    }
+
+    #[test]
+    fn standby_smartctl_result_reports_sleeping_device_without_health_entry() {
+        let devices = [BlockDevice {
+            name: "sda".to_string(),
+            device_type: "disk".to_string(),
+            ..BlockDevice::default()
+        }];
+        let candidates = collectable_devices(&devices);
+
+        let (health, diagnostics) =
+            collect_candidates_with_runner(&candidates, |_program, _args| {
+                Some(commands::OptionalCommandOutput {
+                    output: None,
+                    diagnostic: Some(
+                        "smartctl exited with exit status: 2: Device is in STANDBY mode"
+                            .to_string(),
+                    ),
+                })
+            });
+
+        assert!(health.is_empty());
+        assert_eq!(
+            diagnostics,
+            ["/dev/sda: SMART skipped because device is in standby"]
+        );
     }
 
     #[test]

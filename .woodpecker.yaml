@@ -12,9 +12,17 @@ clone:
       recursive: false
 
 steps:
+  - name: msrv
+    image: rust:1.88-bookworm
+    network_mode: woodpecker-ci_default
+    commands:
+      - cargo check --locked
+
   - name: check
     image: rust:1-bookworm
     network_mode: woodpecker-ci_default
+    depends_on:
+      - msrv
     commands:
       - rustup component add rustfmt clippy
       - make check

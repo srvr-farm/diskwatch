@@ -984,6 +984,7 @@ Copy `.woodpecker.yaml` from `memwatch`, replacing:
 - tag stripping expression `s/^diskwatch-//; s/^v//`
 - binary artifact `diskwatch-$${version}-linux-x86_64`
 - package names `diskwatch_$${version}_amd64.deb` and `diskwatch-$${version}-1.x86_64.rpm`
+- add an explicit MSRV check using `rust:1.88-bookworm` before the floating stable check
 
 Keep the same secret:
 
