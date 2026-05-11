@@ -404,38 +404,82 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diskstats::DiskActivity;
-    use crate::lvm::LvmSnapshot;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     #[test]
-    fn text_report_contains_all_major_sections() {
-        let snapshot = Snapshot {
-            activity: vec![DiskActivity {
-                name: "sda".to_string(),
-                read_bytes_per_sec: Some(1024.0),
-                write_bytes_per_sec: Some(2048.0),
-                read_iops: Some(1.0),
-                write_iops: Some(2.0),
-                busy_percent: Some(3.0),
-            }],
-            filesystems: vec![],
-            devices: vec![],
-            mdraid: vec![],
-            zfs: vec![],
-            lvm: LvmSnapshot::default(),
-            smart: vec![],
-            diagnostics: vec!["zpool not found; ZFS pool data unavailable".to_string()],
-        };
+    fn text_report_has_stable_section_order_and_empty_values() {
+        let snapshot = Snapshot::default();
 
         let report = format_text_report(&snapshot);
-        assert!(report.contains("activity:"));
-        assert!(report.contains("filesystems:"));
-        assert!(report.contains("devices:"));
-        assert!(report.contains("zfs:"));
-        assert!(report.contains("mdraid:"));
-        assert!(report.contains("lvm:"));
-        assert!(report.contains("smart:"));
-        assert!(report.contains("diagnostics:"));
-        assert!(report.contains("sda"));
+
+        assert_eq!(
+            report,
+            "\
+activity:
+  N/A
+filesystems:
+  N/A
+devices:
+  N/A
+zfs:
+  N/A
+mdraid:
+  N/A
+lvm:
+  N/A
+smart:
+  N/A
+diagnostics:
+  N/A
+"
+        );
+    }
+
+    #[test]
+    fn draw_renders_empty_snapshot_labels_and_values() {
+        let output = render_snapshot(80, 24, &Snapshot::default());
+
+        assert!(output.contains("diskwatch  q/Esc/Ctrl-C to quit"));
+        assert!(output.contains("Activity"));
+        assert!(output.contains("Space"));
+        assert!(output.contains("Devices"));
+        assert!(output.contains("Stacks"));
+        assert!(output.contains("Health"));
+        assert!(output.contains("N/A"));
+    }
+
+    #[test]
+    fn draw_renders_diagnostics_band_when_diagnostics_exist() {
+        let snapshot = Snapshot {
+            diagnostics: vec!["zpool not found; ZFS pool data unavailable".to_string()],
+            ..Snapshot::default()
+        };
+
+        let output = render_snapshot(80, 24, &snapshot);
+
+        assert!(output.contains("Diagnostics"));
+        assert!(output.contains("zpool not found; ZFS pool data unavailable"));
+    }
+
+    #[test]
+    fn draw_does_not_panic_on_small_terminal() {
+        let _output = render_snapshot(32, 8, &Snapshot::default());
+    }
+
+    fn render_snapshot(width: u16, height: u16, snapshot: &Snapshot) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, snapshot)).unwrap();
+
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
