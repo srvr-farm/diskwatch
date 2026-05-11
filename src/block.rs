@@ -68,7 +68,7 @@ fn infer_device_type(name: &str) -> &'static str {
         "ram"
     } else if name.starts_with("md") {
         "md"
-    } else if name.starts_with("dm-") {
+    } else if name == "dm" || name.starts_with("dm-") {
         "dm"
     } else if name.starts_with("nvme") {
         "nvme"
@@ -132,5 +132,113 @@ mod tests {
         assert_eq!(devices[0].logical_block_size, Some(512));
         assert_eq!(devices[0].physical_block_size, Some(4096));
         assert_eq!(devices[0].model.as_deref(), Some("FastDisk"));
+    }
+
+    #[test]
+    fn sorts_multiple_devices_by_name() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("sdb")).unwrap();
+        std::fs::create_dir(temp.path().join("nvme0n1")).unwrap();
+        std::fs::create_dir(temp.path().join("sda")).unwrap();
+
+        let names: Vec<_> = collect(temp.path())
+            .into_iter()
+            .map(|device| device.name)
+            .collect();
+
+        assert_eq!(names, ["nvme0n1", "sda", "sdb"]);
+    }
+
+    #[test]
+    fn ignores_non_directory_entries() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("sda")).unwrap();
+        write(&temp.path().join("not-a-device"), "ignored\n");
+
+        let devices = collect(temp.path());
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "sda");
+    }
+
+    #[test]
+    fn missing_and_malformed_fields_use_defaults_without_panicking() {
+        let temp = TempDir::new().unwrap();
+        let sda = temp.path().join("sda");
+        write(&sda.join("size"), "not-a-number\n");
+        write(&sda.join("queue/rotational"), "maybe\n");
+        write(&sda.join("queue/logical_block_size"), "large\n");
+
+        let devices = collect(temp.path());
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "sda");
+        assert_eq!(devices[0].size_bytes, 0);
+        assert_eq!(devices[0].rotational, None);
+        assert_eq!(devices[0].logical_block_size, None);
+        assert_eq!(devices[0].physical_block_size, None);
+        assert_eq!(devices[0].vendor, None);
+        assert_eq!(devices[0].model, None);
+        assert_eq!(devices[0].serial, None);
+    }
+
+    #[test]
+    fn empty_trimmed_metadata_becomes_none() {
+        let temp = TempDir::new().unwrap();
+        let sda = temp.path().join("sda");
+        write(&sda.join("device/vendor"), " \n\t");
+        write(&sda.join("device/model"), "\n");
+        write(&sda.join("device/serial"), "\t\n");
+
+        let devices = collect(temp.path());
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].vendor, None);
+        assert_eq!(devices[0].model, None);
+        assert_eq!(devices[0].serial, None);
+    }
+
+    #[test]
+    fn maps_common_scsi_device_types() {
+        let cases = [
+            ("sda", "0", "disk"),
+            ("sr0", "5", "cdrom"),
+            ("opt0", "7", "optical"),
+            ("zbc0", "14", "zbc"),
+        ];
+
+        for (name, scsi_type, expected_type) in cases {
+            let temp = TempDir::new().unwrap();
+            write(&temp.path().join(name).join("device/type"), scsi_type);
+
+            let devices = collect(temp.path());
+
+            assert_eq!(devices.len(), 1);
+            assert_eq!(devices[0].device_type, expected_type);
+        }
+    }
+
+    #[test]
+    fn infers_device_types_from_names() {
+        let cases = [
+            ("loop0", "loop"),
+            ("ram0", "ram"),
+            ("md0", "md"),
+            ("dm-0", "dm"),
+            ("dm", "dm"),
+            ("nvme0n1", "nvme"),
+            ("mmcblk0", "mmc"),
+            ("sda", "disk"),
+        ];
+
+        for (name, expected_type) in cases {
+            let temp = TempDir::new().unwrap();
+            std::fs::create_dir(temp.path().join(name)).unwrap();
+
+            let devices = collect(temp.path());
+
+            assert_eq!(devices.len(), 1);
+            assert_eq!(devices[0].device_type, expected_type);
+        }
     }
 }
