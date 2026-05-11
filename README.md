@@ -81,10 +81,11 @@ non-interactive environments.
 LVM volumes, SMART settings, kernel tunables, or any other system
 configuration.
 
-Optional command output is cached for 30 seconds in the TUI so slower tools such
-as `zpool`, `mdadm`, LVM commands, or per-device `smartctl` checks do not run on
-every screen refresh. Core activity, filesystem, block-device, and `/proc/mdstat`
-data are still refreshed on the normal interval.
+Optional command output is cached for 30 seconds in the TUI and collected under
+a short aggregate budget so slower tools such as `zpool`, `mdadm`, LVM commands,
+or per-device `smartctl` checks cannot multiply into long UI stalls. Core
+activity, filesystem, block-device, and `/proc/mdstat` data are still refreshed
+on the normal interval.
 
 ## Prerequisites
 
@@ -340,9 +341,9 @@ that use mdraid.
 LVM details use:
 
 ```sh
-pvs
-vgs
-lvs
+pvs --readonly
+vgs --readonly
+lvs --readonly
 ```
 
 Install LVM tools if you want physical volume, volume group, and logical volume

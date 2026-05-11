@@ -76,6 +76,20 @@ pub fn parse_mdadm_detail_scan(input: &str) -> Vec<String> {
 
 pub fn collect_mdadm_detail_scan(timeout: Duration) -> (Vec<String>, Vec<String>) {
     let result = commands::run_optional("mdadm", &["--detail", "--scan"], timeout);
+    parse_mdadm_command_result(result)
+}
+
+pub fn collect_mdadm_detail_scan_budgeted(
+    budget: &commands::OptionalCommandBudget,
+) -> (Vec<String>, Vec<String>) {
+    commands::run_optional_budgeted("mdadm", &["--detail", "--scan"], budget)
+        .map(parse_mdadm_command_result)
+        .unwrap_or_default()
+}
+
+fn parse_mdadm_command_result(
+    result: commands::OptionalCommandOutput,
+) -> (Vec<String>, Vec<String>) {
     let details = result
         .output
         .as_deref()
@@ -105,7 +119,12 @@ fn mdadm_detail_array_name(detail: &str) -> Option<String> {
     }
 
     let path = fields.next()?;
-    path.rsplit('/').next().map(str::to_string)
+    let name = path.rsplit('/').next()?;
+    if path.starts_with("/dev/md/") && name.chars().all(|character| character.is_ascii_digit()) {
+        Some(format!("md{name}"))
+    } else {
+        Some(name.to_string())
+    }
 }
 
 fn apply_detail_line(array: &mut MdArray, line: &str) {
@@ -184,6 +203,22 @@ mod tests {
         assert_eq!(
             arrays[0].detail.as_deref(),
             Some("ARRAY /dev/md0 metadata=1.2 UUID=abc name=host:0")
+        );
+    }
+
+    #[test]
+    fn applies_mdadm_detail_scan_with_md_slash_number_path() {
+        let mut arrays = parse_mdstat(
+            "md0 : active raid1 sdb1[1] sda1[0]\n      1046528 blocks super 1.2 [2/2] [UU]\n",
+        );
+        let details =
+            parse_mdadm_detail_scan("ARRAY /dev/md/0 metadata=1.2 UUID=abc name=host:0\n");
+
+        apply_mdadm_detail_scan(&mut arrays, &details);
+
+        assert_eq!(
+            arrays[0].detail.as_deref(),
+            Some("ARRAY /dev/md/0 metadata=1.2 UUID=abc name=host:0")
         );
     }
 }

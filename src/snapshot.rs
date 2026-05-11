@@ -1,4 +1,5 @@
 use crate::block::{collect as collect_block_devices, BlockDevice};
+use crate::commands::OptionalCommandBudget;
 use crate::diskstats::{activities_between, read_diskstats, DiskActivity, DiskStat};
 use crate::filesystems::{collect as collect_filesystems, FilesystemUsage};
 use crate::lvm::{self, LvmSnapshot};
@@ -9,7 +10,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_millis(750);
+const OPTIONAL_COMMAND_TOTAL_BUDGET: Duration = Duration::from_millis(750);
 const OPTIONAL_COMMAND_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const OPTIONAL_COMMAND_BUDGET_EXHAUSTED_DIAGNOSTIC: &str =
+    "optional command budget exhausted; remaining optional data deferred";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
@@ -184,30 +188,80 @@ impl Sampler {
     }
 
     fn collect_optional_commands(&self, devices: &[BlockDevice]) -> OptionalCommandCache {
+        let budget =
+            OptionalCommandBudget::new(OPTIONAL_COMMAND_TOTAL_BUDGET, DEFAULT_COMMAND_TIMEOUT);
         let mut diagnostics = Vec::new();
 
-        let (zfs, zfs_diagnostics) = zfs::collect(DEFAULT_COMMAND_TIMEOUT);
+        let (zfs, zfs_diagnostics) = zfs::collect_budgeted(&budget);
         diagnostics.extend(zfs_diagnostics);
-
-        let (mdadm_scan, mdadm_diagnostics) =
-            raid::collect_mdadm_detail_scan(DEFAULT_COMMAND_TIMEOUT);
-        diagnostics.extend(mdadm_diagnostics);
-
-        let (lvm, lvm_diagnostics) = lvm::collect(DEFAULT_COMMAND_TIMEOUT);
-        diagnostics.extend(lvm_diagnostics);
-
-        let (smart, smart_diagnostics) = smart::collect(devices, DEFAULT_COMMAND_TIMEOUT);
-        diagnostics.extend(smart_diagnostics);
-
-        OptionalCommandCache {
-            zfs,
-            mdadm_scan,
-            lvm,
-            smart,
-            diagnostics,
-            device_names: Vec::new(),
-            collected_at: None,
+        if append_budget_exhausted_if_needed(&budget, &mut diagnostics) {
+            return optional_cache(
+                zfs,
+                Vec::new(),
+                LvmSnapshot::default(),
+                Vec::new(),
+                diagnostics,
+            );
         }
+
+        let (mdadm_scan, mdadm_diagnostics) = raid::collect_mdadm_detail_scan_budgeted(&budget);
+        diagnostics.extend(mdadm_diagnostics);
+        if append_budget_exhausted_if_needed(&budget, &mut diagnostics) {
+            return optional_cache(
+                zfs,
+                mdadm_scan,
+                LvmSnapshot::default(),
+                Vec::new(),
+                diagnostics,
+            );
+        }
+
+        let (lvm, lvm_diagnostics) = lvm::collect_budgeted(&budget);
+        diagnostics.extend(lvm_diagnostics);
+        if append_budget_exhausted_if_needed(&budget, &mut diagnostics) {
+            return optional_cache(zfs, mdadm_scan, lvm, Vec::new(), diagnostics);
+        }
+
+        let (smart, smart_diagnostics) = smart::collect_budgeted(devices, &budget);
+        diagnostics.extend(smart_diagnostics);
+        append_budget_exhausted_if_needed(&budget, &mut diagnostics);
+
+        optional_cache(zfs, mdadm_scan, lvm, smart, diagnostics)
+    }
+}
+
+fn optional_cache(
+    zfs: Vec<Zpool>,
+    mdadm_scan: Vec<String>,
+    lvm: LvmSnapshot,
+    smart: Vec<SmartHealth>,
+    diagnostics: Vec<String>,
+) -> OptionalCommandCache {
+    OptionalCommandCache {
+        zfs,
+        mdadm_scan,
+        lvm,
+        smart,
+        diagnostics,
+        device_names: Vec::new(),
+        collected_at: None,
+    }
+}
+
+fn append_budget_exhausted_if_needed(
+    budget: &OptionalCommandBudget,
+    diagnostics: &mut Vec<String>,
+) -> bool {
+    if budget.exhausted() {
+        if !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic == OPTIONAL_COMMAND_BUDGET_EXHAUSTED_DIAGNOSTIC)
+        {
+            diagnostics.push(OPTIONAL_COMMAND_BUDGET_EXHAUSTED_DIAGNOSTIC.to_string());
+        }
+        true
+    } else {
+        false
     }
 }
 

@@ -1,6 +1,31 @@
 use crate::commands;
 use std::time::Duration;
 
+const PVS_ARGS: &[&str] = &[
+    "--readonly",
+    "--noheadings",
+    "--separator",
+    "\t",
+    "-o",
+    "pv_name,vg_name,pv_size,pv_free",
+];
+const VGS_ARGS: &[&str] = &[
+    "--readonly",
+    "--noheadings",
+    "--separator",
+    "\t",
+    "-o",
+    "vg_name,vg_size,vg_free",
+];
+const LVS_ARGS: &[&str] = &[
+    "--readonly",
+    "--noheadings",
+    "--separator",
+    "\t",
+    "-o",
+    "lv_name,vg_name,lv_size,lv_attr",
+];
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VolumeGroup {
     pub name: String,
@@ -73,64 +98,64 @@ pub fn parse_lvs(input: &str) -> Vec<LogicalVolume> {
 }
 
 pub fn collect(timeout: Duration) -> (LvmSnapshot, Vec<String>) {
+    collect_with_runner(|program, args| Some(commands::run_optional(program, args, timeout)))
+}
+
+pub fn collect_budgeted(budget: &commands::OptionalCommandBudget) -> (LvmSnapshot, Vec<String>) {
+    collect_with_runner(|program, args| commands::run_optional_budgeted(program, args, budget))
+}
+
+fn collect_with_runner<F>(mut run: F) -> (LvmSnapshot, Vec<String>)
+where
+    F: FnMut(&str, &[&str]) -> Option<commands::OptionalCommandOutput>,
+{
     let mut snapshot = LvmSnapshot::default();
     let mut diagnostics = Vec::new();
 
-    let pvs = commands::run_optional(
-        "pvs",
-        &[
-            "--noheadings",
-            "--separator",
-            "\t",
-            "-o",
-            "pv_name,vg_name,pv_size,pv_free",
-        ],
-        timeout,
-    );
-    if let Some(output) = pvs.output {
-        snapshot.physical_volumes = parse_pvs(&output);
-    }
-    if let Some(diagnostic) = pvs.diagnostic {
-        diagnostics.push(diagnostic);
+    if let Some(pvs) = run("pvs", pvs_args()) {
+        if let Some(output) = pvs.output {
+            snapshot.physical_volumes = parse_pvs(&output);
+        }
+        if let Some(diagnostic) = pvs.diagnostic {
+            diagnostics.push(diagnostic);
+        }
+    } else {
+        return (snapshot, diagnostics);
     }
 
-    let vgs = commands::run_optional(
-        "vgs",
-        &[
-            "--noheadings",
-            "--separator",
-            "\t",
-            "-o",
-            "vg_name,vg_size,vg_free",
-        ],
-        timeout,
-    );
-    if let Some(output) = vgs.output {
-        snapshot.volume_groups = parse_vgs(&output);
-    }
-    if let Some(diagnostic) = vgs.diagnostic {
-        diagnostics.push(diagnostic);
+    if let Some(vgs) = run("vgs", vgs_args()) {
+        if let Some(output) = vgs.output {
+            snapshot.volume_groups = parse_vgs(&output);
+        }
+        if let Some(diagnostic) = vgs.diagnostic {
+            diagnostics.push(diagnostic);
+        }
+    } else {
+        return (snapshot, diagnostics);
     }
 
-    let lvs = commands::run_optional(
-        "lvs",
-        &[
-            "--noheadings",
-            "--separator",
-            "\t",
-            "-o",
-            "lv_name,vg_name,lv_size,lv_attr",
-        ],
-        timeout,
-    );
-    if let Some(output) = lvs.output {
-        snapshot.logical_volumes = parse_lvs(&output);
-    }
-    if let Some(diagnostic) = lvs.diagnostic {
-        diagnostics.push(diagnostic);
+    if let Some(lvs) = run("lvs", lvs_args()) {
+        if let Some(output) = lvs.output {
+            snapshot.logical_volumes = parse_lvs(&output);
+        }
+        if let Some(diagnostic) = lvs.diagnostic {
+            diagnostics.push(diagnostic);
+        }
     }
 
     (snapshot, diagnostics)
+}
+
+fn pvs_args() -> &'static [&'static str] {
+    PVS_ARGS
+}
+
+fn vgs_args() -> &'static [&'static str] {
+    VGS_ARGS
+}
+
+fn lvs_args() -> &'static [&'static str] {
+    LVS_ARGS
 }
 
 fn parse_rows(input: &str) -> Vec<Vec<&str>> {
@@ -162,5 +187,12 @@ mod tests {
         let lvs = parse_lvs("root\tvg0\t100.00g\t-wi-ao----\n");
         assert_eq!(lvs[0].name, "root");
         assert_eq!(lvs[0].vg_name, "vg0");
+    }
+
+    #[test]
+    fn lvm_command_args_are_read_only() {
+        assert!(pvs_args().contains(&"--readonly"));
+        assert!(vgs_args().contains(&"--readonly"));
+        assert!(lvs_args().contains(&"--readonly"));
     }
 }

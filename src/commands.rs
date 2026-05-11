@@ -15,6 +15,46 @@ pub struct OptionalCommandOutput {
     pub diagnostic: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct OptionalCommandBudget {
+    started: Instant,
+    total: Duration,
+    per_command: Duration,
+}
+
+impl OptionalCommandBudget {
+    pub fn new(total: Duration, per_command: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            total,
+            per_command,
+        }
+    }
+
+    pub fn remaining_timeout(&self) -> Option<Duration> {
+        let remaining = self.total.checked_sub(self.started.elapsed())?;
+        if remaining.is_zero() || self.per_command.is_zero() {
+            None
+        } else {
+            Some(remaining.min(self.per_command))
+        }
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.remaining_timeout().is_none()
+    }
+}
+
+pub fn run_optional_budgeted(
+    program: &str,
+    args: &[&str],
+    budget: &OptionalCommandBudget,
+) -> Option<OptionalCommandOutput> {
+    budget
+        .remaining_timeout()
+        .map(|timeout| run_optional(program, args, timeout))
+}
+
 pub fn run_optional(program: &str, args: &[&str], timeout: Duration) -> OptionalCommandOutput {
     if find_in_path(program).is_none() {
         return OptionalCommandOutput {
@@ -332,6 +372,10 @@ fn poll_interval(started: Instant, timeout: Duration) -> Duration {
         .min(Duration::from_millis(10))
 }
 
+pub fn program_available(program: &str) -> bool {
+    find_in_path(program).is_some()
+}
+
 fn find_in_path(program: &str) -> Option<PathBuf> {
     let path = Path::new(program);
     if path.components().count() > 1 {
@@ -559,5 +603,17 @@ mod tests {
             "expected timeout diagnostic, got {:?}",
             result.diagnostic
         );
+    }
+
+    #[test]
+    fn budgeted_optional_runner_stops_after_total_timeout() {
+        let budget = OptionalCommandBudget::new(Duration::from_millis(25), Duration::from_secs(1));
+        let first = run_optional_budgeted("sh", &["-c", "sleep 1"], &budget);
+
+        assert!(first
+            .and_then(|result| result.diagnostic)
+            .is_some_and(|diagnostic| diagnostic.contains("timed out")));
+        assert!(budget.exhausted());
+        assert!(run_optional_budgeted("printf", &["hello"], &budget).is_none());
     }
 }

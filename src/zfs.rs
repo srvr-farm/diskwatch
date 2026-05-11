@@ -98,13 +98,39 @@ pub fn parse_zpool_status(input: &str) -> Vec<ZpoolStatus> {
 }
 
 pub fn collect(timeout: Duration) -> (Vec<Zpool>, Vec<String>) {
+    collect_with_availability(timeout, commands::program_available("zpool"))
+}
+
+pub fn collect_budgeted(budget: &commands::OptionalCommandBudget) -> (Vec<Zpool>, Vec<String>) {
+    if !commands::program_available("zpool") {
+        return (Vec::new(), vec!["zpool not found".to_string()]);
+    }
+
+    collect_with_runner(|program, args| commands::run_optional_budgeted(program, args, budget))
+}
+
+fn collect_with_availability(
+    timeout: Duration,
+    zpool_available: bool,
+) -> (Vec<Zpool>, Vec<String>) {
+    if !zpool_available {
+        return (Vec::new(), vec!["zpool not found".to_string()]);
+    }
+
+    collect_with_runner(|program, args| Some(commands::run_optional(program, args, timeout)))
+}
+
+fn collect_with_runner<F>(mut run: F) -> (Vec<Zpool>, Vec<String>)
+where
+    F: FnMut(&str, &[&str]) -> Option<commands::OptionalCommandOutput>,
+{
     let mut diagnostics = Vec::new();
-    let list_result = commands::run_optional(
+    let Some(list_result) = run(
         "zpool",
         &["list", "-H", "-o", "name,size,alloc,free,health"],
-        timeout,
-    );
-    let status_result = commands::run_optional("zpool", &["status"], timeout);
+    ) else {
+        return (Vec::new(), diagnostics);
+    };
 
     let mut pools = list_result
         .output
@@ -114,6 +140,10 @@ pub fn collect(timeout: Duration) -> (Vec<Zpool>, Vec<String>) {
     if let Some(diagnostic) = list_result.diagnostic {
         diagnostics.push(diagnostic);
     }
+
+    let Some(status_result) = run("zpool", &["status"]) else {
+        return (pools, diagnostics);
+    };
 
     let statuses = status_result
         .output
@@ -179,5 +209,13 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("devices could not be used"));
+    }
+
+    #[test]
+    fn missing_zpool_reports_one_diagnostic() {
+        let (pools, diagnostics) = collect_with_availability(Duration::from_secs(1), false);
+
+        assert!(pools.is_empty());
+        assert_eq!(diagnostics, ["zpool not found"]);
     }
 }

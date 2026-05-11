@@ -43,15 +43,66 @@ pub fn parse_smartctl(device: &str, input: &str) -> SmartHealth {
 }
 
 pub fn collect(devices: &[BlockDevice], timeout: Duration) -> (Vec<SmartHealth>, Vec<String>) {
+    collect_with_availability(devices, timeout, commands::program_available("smartctl"))
+}
+
+pub fn collect_budgeted(
+    devices: &[BlockDevice],
+    budget: &commands::OptionalCommandBudget,
+) -> (Vec<SmartHealth>, Vec<String>) {
+    let candidates = collectable_devices(devices);
+    if candidates.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    if !commands::program_available("smartctl") {
+        return (Vec::new(), vec!["smartctl not found".to_string()]);
+    }
+
+    collect_candidates_with_runner(&candidates, |program, args| {
+        commands::run_optional_budgeted(program, args, budget)
+    })
+}
+
+fn collect_with_availability(
+    devices: &[BlockDevice],
+    timeout: Duration,
+    smartctl_available: bool,
+) -> (Vec<SmartHealth>, Vec<String>) {
+    let candidates = collectable_devices(devices);
+    if candidates.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    if !smartctl_available {
+        return (Vec::new(), vec!["smartctl not found".to_string()]);
+    }
+
+    collect_candidates_with_runner(&candidates, |program, args| {
+        Some(commands::run_optional(program, args, timeout))
+    })
+}
+
+fn collectable_devices(devices: &[BlockDevice]) -> Vec<&BlockDevice> {
+    devices
+        .iter()
+        .filter(|device| should_collect_device(device))
+        .collect()
+}
+
+fn collect_candidates_with_runner<F>(
+    devices: &[&BlockDevice],
+    mut run: F,
+) -> (Vec<SmartHealth>, Vec<String>)
+where
+    F: FnMut(&str, &[&str]) -> Option<commands::OptionalCommandOutput>,
+{
     let mut health = Vec::new();
     let mut diagnostics = Vec::new();
 
-    for device in devices
-        .iter()
-        .filter(|device| should_collect_device(device))
-    {
+    for device in devices {
         let path = format!("/dev/{}", device.name);
-        let result = commands::run_optional("smartctl", &["-A", "-H", &path], timeout);
+        let Some(result) = run("smartctl", &["-A", "-H", &path]) else {
+            break;
+        };
         if let Some(output) = result.output {
             health.push(parse_smartctl(&path, &output));
         }
@@ -291,5 +342,27 @@ mod tests {
         let health = parse_smartctl("/dev/sda", input);
 
         assert_eq!(health.wearout_percent, Some(20));
+    }
+
+    #[test]
+    fn missing_smartctl_reports_one_diagnostic_for_many_devices() {
+        let devices = vec![
+            BlockDevice {
+                name: "sda".to_string(),
+                device_type: "disk".to_string(),
+                ..BlockDevice::default()
+            },
+            BlockDevice {
+                name: "nvme0n1".to_string(),
+                device_type: "nvme".to_string(),
+                ..BlockDevice::default()
+            },
+        ];
+
+        let (health, diagnostics) =
+            collect_with_availability(&devices, Duration::from_secs(1), false);
+
+        assert!(health.is_empty());
+        assert_eq!(diagnostics, ["smartctl not found"]);
     }
 }

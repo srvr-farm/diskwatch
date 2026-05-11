@@ -4,7 +4,7 @@
 
 **Goal:** Build `diskwatch`, a read-only Linux storage monitor TUI and one-shot report tool matching the `cpuwatch` and `memwatch` workflow, packaging, and release pipeline.
 
-**Architecture:** Implement a Rust crate shaped like the sibling watch tools: shared CLI/TUI loop in `lib.rs`, snapshot orchestration in `snapshot.rs`, focused storage collectors, and text/TUI rendering in `render.rs`. Baseline collectors read `/proc` and `/sys`; optional command collectors use short timeout-bound read-only commands and degrade to `N/A` plus diagnostics.
+**Architecture:** Implement a Rust crate shaped like the sibling watch tools: shared CLI/TUI loop in `lib.rs`, snapshot orchestration in `snapshot.rs`, focused storage collectors, and text/TUI rendering in `render.rs`. Baseline collectors read `/proc` and `/sys`; optional command collectors use short timeout-bound read-only commands under an aggregate refresh budget and degrade to `N/A` plus diagnostics.
 
 **Tech Stack:** Rust 2021, `ratatui`, `crossterm`, `clap`, `humantime`, `anyhow`, `libc`, Makefile packaging, Woodpecker CI, Debian/RPM package templates.
 
@@ -42,7 +42,7 @@ Implementation workers should use @superpowers:test-driven-development inside ea
 
 - `--once` must always print the stable section headings from the spec. Empty optional sections print `N/A`.
 - Optional command timeout defaults to `750ms` per command in `snapshot.rs`.
-- Missing optional commands produce concise diagnostics such as `zpool not found; ZFS pool data unavailable`.
+- Missing optional commands produce concise diagnostics such as `zpool not found`.
 - Diskstat sectors are treated as 512-byte sectors for throughput calculations.
 - The first TUI sample may show `N/A` rates until a previous `/proc/diskstats` sample exists.
 - The first `--once` run follows the sibling tools: sample, sleep for `--interval`, sample again, print.
