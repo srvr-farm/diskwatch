@@ -1,5 +1,7 @@
+use crate::commands;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MdArray {
@@ -8,6 +10,7 @@ pub struct MdArray {
     pub devices: Vec<String>,
     pub status: Option<String>,
     pub blocks: Option<u64>,
+    pub detail: Option<String>,
 }
 
 pub fn read_mdstat(path: &Path) -> Vec<MdArray> {
@@ -48,6 +51,7 @@ pub fn parse_mdstat(input: &str) -> Vec<MdArray> {
                 devices,
                 status: None,
                 blocks: None,
+                detail: None,
             });
         } else if let Some(array) = current.as_mut() {
             apply_detail_line(array, line);
@@ -68,6 +72,40 @@ pub fn parse_mdadm_detail_scan(input: &str) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+pub fn collect_mdadm_detail_scan(timeout: Duration) -> (Vec<String>, Vec<String>) {
+    let result = commands::run_optional("mdadm", &["--detail", "--scan"], timeout);
+    let details = result
+        .output
+        .as_deref()
+        .map(parse_mdadm_detail_scan)
+        .unwrap_or_default();
+    let diagnostics = result.diagnostic.into_iter().collect();
+
+    (details, diagnostics)
+}
+
+pub fn apply_mdadm_detail_scan(arrays: &mut [MdArray], details: &[String]) {
+    for detail in details {
+        let Some(name) = mdadm_detail_array_name(detail) else {
+            continue;
+        };
+
+        if let Some(array) = arrays.iter_mut().find(|array| array.name == name) {
+            array.detail = Some(detail.clone());
+        }
+    }
+}
+
+fn mdadm_detail_array_name(detail: &str) -> Option<String> {
+    let mut fields = detail.split_whitespace();
+    if fields.next()? != "ARRAY" {
+        return None;
+    }
+
+    let path = fields.next()?;
+    path.rsplit('/').next().map(str::to_string)
 }
 
 fn apply_detail_line(array: &mut MdArray, line: &str) {
@@ -131,6 +169,21 @@ mod tests {
                 "ARRAY /dev/md0 metadata=1.2 UUID=abc name=host:0",
                 "ARRAY /dev/md1 UUID=def"
             ]
+        );
+    }
+
+    #[test]
+    fn applies_mdadm_detail_scan_to_matching_mdstat_arrays() {
+        let mut arrays = parse_mdstat(
+            "md0 : active raid1 sdb1[1] sda1[0]\n      1046528 blocks super 1.2 [2/2] [UU]\n",
+        );
+        let details = parse_mdadm_detail_scan("ARRAY /dev/md0 metadata=1.2 UUID=abc name=host:0\n");
+
+        apply_mdadm_detail_scan(&mut arrays, &details);
+
+        assert_eq!(
+            arrays[0].detail.as_deref(),
+            Some("ARRAY /dev/md0 metadata=1.2 UUID=abc name=host:0")
         );
     }
 }

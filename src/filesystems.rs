@@ -8,7 +8,6 @@ const SKIPPED_FS_TYPES: &[&str] = &[
     "sysfs",
     "devtmpfs",
     "devpts",
-    "tmpfs",
     "cgroup",
     "cgroup2",
     "securityfs",
@@ -21,7 +20,6 @@ const SKIPPED_FS_TYPES: &[&str] = &[
     "mqueue",
     "hugetlbfs",
     "autofs",
-    "overlay",
 ];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -224,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_skips_pseudo_filesystem_types() {
+    fn collect_skips_kernel_pseudo_filesystems_but_keeps_capacity_mounts() {
         let mountpoint = TempDir::new().unwrap();
         let mounts = TempDir::new().unwrap();
         let mounts_path = mounts.path().join("mounts");
@@ -241,7 +239,11 @@ mod tests {
 
         let filesystems = collect(&mounts_path);
 
-        assert!(filesystems.is_empty());
+        let fs_types: Vec<_> = filesystems
+            .iter()
+            .map(|filesystem| filesystem.fs_type.as_str())
+            .collect();
+        assert_eq!(fs_types, ["tmpfs", "overlay"]);
     }
 
     #[test]

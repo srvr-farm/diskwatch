@@ -1,9 +1,10 @@
 use std::env;
-use std::io::{self, Read};
+use std::io::{self, ErrorKind, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::thread::{self, JoinHandle};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 const STDERR_DIAGNOSTIC_LIMIT: usize = 512;
@@ -52,38 +53,53 @@ pub fn run_optional(program: &str, args: &[&str], timeout: Duration) -> Optional
     ensure_child_process_group(&child);
     let process_group = ProcessGroup::from_child(&child);
 
-    let stdout = child.stdout.take().map(spawn_reader);
-    let stderr = child.stderr.take().map(spawn_reader);
+    let mut output =
+        match CommandOutputReaders::new(child.stdout.take(), child.stderr.take(), program) {
+            Ok(output) => output,
+            Err(diagnostic) => {
+                kill_process_group(process_group);
+                let _ = child.wait();
+                return OptionalCommandOutput {
+                    output: None,
+                    diagnostic: Some(diagnostic),
+                };
+            }
+        };
 
     if timeout.is_zero() {
-        return timeout_result(program, child, process_group, stdout, stderr, timeout);
+        return timeout_result(program, child, process_group, output, timeout);
     }
 
     let started = Instant::now();
     loop {
+        if let Err(diagnostic) = output.drain(program) {
+            kill_process_group(process_group);
+            let _ = child.wait();
+            return OptionalCommandOutput {
+                output: None,
+                diagnostic: Some(diagnostic),
+            };
+        }
+
         match child.try_wait() {
             Ok(Some(status)) => {
                 kill_process_group(process_group);
-                let output = match collect_output(program, stdout, stderr) {
-                    Ok(output) => output,
-                    Err(diagnostic) => {
-                        return OptionalCommandOutput {
-                            output: None,
-                            diagnostic: Some(diagnostic),
-                        }
-                    }
+                if let Err(diagnostic) = output.drain(program) {
+                    return OptionalCommandOutput {
+                        output: None,
+                        diagnostic: Some(diagnostic),
+                    };
                 };
 
-                return output_result(program, status, output);
+                return output_result(program, status, output.into_bytes());
             }
             Ok(None) if started.elapsed() >= timeout => {
-                return timeout_result(program, child, process_group, stdout, stderr, timeout);
+                return timeout_result(program, child, process_group, output, timeout);
             }
             Ok(None) => thread::sleep(poll_interval(started, timeout)),
             Err(error) => {
                 kill_process_group(process_group);
                 let _ = child.wait();
-                let _ = collect_output(program, stdout, stderr);
                 return OptionalCommandOutput {
                     output: None,
                     diagnostic: Some(format!("failed while waiting for {program}: {error}")),
@@ -121,42 +137,106 @@ struct CommandOutputBytes {
     stderr: Vec<u8>,
 }
 
-fn spawn_reader<R>(mut reader: R) -> JoinHandle<io::Result<Vec<u8>>>
+struct CommandOutputReaders {
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+    stdout_bytes: Vec<u8>,
+    stderr_bytes: Vec<u8>,
+}
+
+impl CommandOutputReaders {
+    fn new(
+        stdout: Option<ChildStdout>,
+        stderr: Option<ChildStderr>,
+        program: &str,
+    ) -> Result<Self, String> {
+        if let Some(stdout) = stdout.as_ref() {
+            set_nonblocking(stdout, program, "stdout")?;
+        }
+        if let Some(stderr) = stderr.as_ref() {
+            set_nonblocking(stderr, program, "stderr")?;
+        }
+
+        Ok(Self {
+            stdout,
+            stderr,
+            stdout_bytes: Vec::new(),
+            stderr_bytes: Vec::new(),
+        })
+    }
+
+    fn drain(&mut self, program: &str) -> Result<(), String> {
+        drain_reader(program, "stdout", &mut self.stdout, &mut self.stdout_bytes)?;
+        drain_reader(program, "stderr", &mut self.stderr, &mut self.stderr_bytes)
+    }
+
+    fn into_bytes(self) -> CommandOutputBytes {
+        CommandOutputBytes {
+            stdout: self.stdout_bytes,
+            stderr: self.stderr_bytes,
+        }
+    }
+}
+
+fn set_nonblocking<R>(reader: &R, program: &str, stream_name: &str) -> Result<(), String>
 where
-    R: Read + Send + 'static,
+    R: AsRawFd,
 {
-    thread::spawn(move || {
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output)?;
-        Ok(output)
-    })
+    let fd = reader.as_raw_fd();
+
+    // SAFETY: `fcntl` operates on a valid pipe fd owned by the child handle and does not
+    // dereference pointers.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(format!(
+            "failed to read {program} {stream_name}: {}",
+            io::Error::last_os_error()
+        ));
+    }
+
+    // SAFETY: `fcntl` updates flags on the same valid fd. Failure is reported as a diagnostic.
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if result < 0 {
+        return Err(format!(
+            "failed to read {program} {stream_name}: {}",
+            io::Error::last_os_error()
+        ));
+    }
+
+    Ok(())
 }
 
-fn collect_output(
-    program: &str,
-    stdout: Option<JoinHandle<io::Result<Vec<u8>>>>,
-    stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
-) -> Result<CommandOutputBytes, String> {
-    Ok(CommandOutputBytes {
-        stdout: join_reader(program, "stdout", stdout)?,
-        stderr: join_reader(program, "stderr", stderr)?,
-    })
-}
-
-fn join_reader(
+fn drain_reader<R>(
     program: &str,
     stream_name: &str,
-    reader: Option<JoinHandle<io::Result<Vec<u8>>>>,
-) -> Result<Vec<u8>, String> {
-    let Some(reader) = reader else {
-        return Ok(Vec::new());
+    reader: &mut Option<R>,
+    output: &mut Vec<u8>,
+) -> Result<(), String>
+where
+    R: Read,
+{
+    let Some(stream) = reader.as_mut() else {
+        return Ok(());
     };
 
-    match reader.join() {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(error)) => Err(format!("failed to read {program} {stream_name}: {error}")),
-        Err(_) => Err(format!("{program} {stream_name} reader failed")),
+    let mut buffer = [0_u8; 8192];
+    let reached_eof = loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break true,
+            Ok(bytes_read) => output.extend_from_slice(&buffer[..bytes_read]),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => break false,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(format!("failed to read {program} {stream_name}: {error}"));
+            }
+        }
+    };
+
+    if reached_eof {
+        *reader = None;
     }
+
+    Ok(())
 }
 
 fn output_result(
@@ -207,13 +287,12 @@ fn timeout_result(
     program: &str,
     mut child: Child,
     process_group: ProcessGroup,
-    stdout: Option<JoinHandle<io::Result<Vec<u8>>>>,
-    stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    mut output: CommandOutputReaders,
     timeout: Duration,
 ) -> OptionalCommandOutput {
     kill_process_group(process_group);
     let _ = child.wait();
-    let _ = collect_output(program, stdout, stderr);
+    let _ = output.drain(program);
     OptionalCommandOutput {
         output: None,
         diagnostic: Some(format!("{program} timed out after {timeout:?}")),
@@ -338,6 +417,35 @@ mod tests {
     }
 
     #[test]
+    fn timeout_does_not_wait_for_escaped_descendant_holding_output_pipes() {
+        if find_in_path("setsid").is_none() {
+            return;
+        }
+
+        let started = Instant::now();
+        let result = run_optional(
+            "sh",
+            &["-c", "setsid sh -c 'sleep 1' & wait"],
+            Duration::from_millis(25),
+        );
+
+        assert!(result.output.is_none());
+        assert!(
+            result
+                .diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("timed out")),
+            "expected timeout diagnostic, got {:?}",
+            result.diagnostic
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "timeout waited for escaped descendant sleep: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn successful_exit_cleans_up_lingering_descendant_holding_output_pipes() {
         let started = Instant::now();
         let result = run_optional(
@@ -351,6 +459,28 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(500),
             "successful command waited for lingering descendant: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn successful_exit_does_not_wait_for_escaped_descendant_holding_output_pipes() {
+        if find_in_path("setsid").is_none() {
+            return;
+        }
+
+        let started = Instant::now();
+        let result = run_optional(
+            "sh",
+            &["-c", "setsid sh -c 'sleep 1' & printf done"],
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(result.output.as_deref(), Some("done"));
+        assert_eq!(result.diagnostic, None);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "successful command waited for escaped descendant: {:?}",
             started.elapsed()
         );
     }

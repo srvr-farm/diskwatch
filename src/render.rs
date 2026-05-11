@@ -262,7 +262,7 @@ fn write_mdraid_lines(output: &mut String, snapshot: &Snapshot, indent: &str) {
     for array in &snapshot.mdraid {
         writeln!(
             output,
-            "{indent}{} level={} blocks={} status={} devices={}",
+            "{indent}{} level={} blocks={} status={} devices={} detail={}",
             array.name,
             format_optional(array.level.as_deref()),
             array
@@ -274,7 +274,8 @@ fn write_mdraid_lines(output: &mut String, snapshot: &Snapshot, indent: &str) {
                 "N/A".to_string()
             } else {
                 array.devices.join(",")
-            }
+            },
+            format_optional(array.detail.as_deref())
         )
         .unwrap();
     }
@@ -404,6 +405,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raid::MdArray;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -460,6 +462,25 @@ diagnostics:
 
         assert!(output.contains("Diagnostics"));
         assert!(output.contains("zpool not found; ZFS pool data unavailable"));
+    }
+
+    #[test]
+    fn text_report_includes_mdadm_detail_when_present() {
+        let snapshot = Snapshot {
+            mdraid: vec![MdArray {
+                name: "md0".to_string(),
+                level: Some("raid1".to_string()),
+                devices: vec!["sda1[0]".to_string(), "sdb1[1]".to_string()],
+                status: Some("[UU]".to_string()),
+                blocks: Some(1046528),
+                detail: Some("ARRAY /dev/md0 metadata=1.2 UUID=abc name=host:0".to_string()),
+            }],
+            ..Snapshot::default()
+        };
+
+        let report = format_text_report(&snapshot);
+
+        assert!(report.contains("detail=ARRAY /dev/md0 metadata=1.2 UUID=abc name=host:0"));
     }
 
     #[test]

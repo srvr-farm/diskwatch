@@ -2,13 +2,14 @@ use crate::block::{collect as collect_block_devices, BlockDevice};
 use crate::diskstats::{activities_between, read_diskstats, DiskActivity, DiskStat};
 use crate::filesystems::{collect as collect_filesystems, FilesystemUsage};
 use crate::lvm::{self, LvmSnapshot};
-use crate::raid::{read_mdstat, MdArray};
+use crate::raid::{self, read_mdstat, MdArray};
 use crate::smart::{self, SmartHealth};
 use crate::zfs::{self, Zpool};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_millis(750);
+const OPTIONAL_COMMAND_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
@@ -22,6 +23,17 @@ pub struct Snapshot {
     pub diagnostics: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+struct OptionalCommandCache {
+    zfs: Vec<Zpool>,
+    mdadm_scan: Vec<String>,
+    lvm: LvmSnapshot,
+    smart: Vec<SmartHealth>,
+    diagnostics: Vec<String>,
+    device_names: Vec<String>,
+    collected_at: Option<Instant>,
+}
+
 #[derive(Debug)]
 pub struct Sampler {
     diskstats_path: PathBuf,
@@ -29,6 +41,7 @@ pub struct Sampler {
     mounts_path: PathBuf,
     mdstat_path: PathBuf,
     optional_commands_enabled: bool,
+    optional_cache: OptionalCommandCache,
     previous_diskstats: Vec<DiskStat>,
     previous_at: Option<Instant>,
 }
@@ -41,6 +54,7 @@ impl Default for Sampler {
             mounts_path: PathBuf::from("/proc/mounts"),
             mdstat_path: PathBuf::from("/proc/mdstat"),
             optional_commands_enabled: true,
+            optional_cache: OptionalCommandCache::default(),
             previous_diskstats: Vec::new(),
             previous_at: None,
         }
@@ -70,6 +84,7 @@ impl Sampler {
             mounts_path,
             mdstat_path,
             optional_commands_enabled: false,
+            optional_cache: OptionalCommandCache::default(),
             previous_diskstats: Vec::new(),
             previous_at: None,
         }
@@ -115,8 +130,9 @@ impl Sampler {
 
         let devices = collect_block_devices(&self.sys_block_root);
         let filesystems = collect_filesystems(&self.mounts_path);
-        let mdraid = read_mdstat(&self.mdstat_path);
-        let (zfs, lvm, smart, diagnostics) = self.collect_optional_commands(&devices);
+        let mut mdraid = read_mdstat(&self.mdstat_path);
+        let optional_commands = self.optional_commands_snapshot(&devices, now);
+        raid::apply_mdadm_detail_scan(&mut mdraid, &optional_commands.mdadm_scan);
 
         self.previous_diskstats = current_diskstats;
         self.previous_at = Some(now);
@@ -126,25 +142,56 @@ impl Sampler {
             filesystems,
             devices,
             mdraid,
-            zfs,
-            lvm,
-            smart,
-            diagnostics,
+            zfs: optional_commands.zfs,
+            lvm: optional_commands.lvm,
+            smart: optional_commands.smart,
+            diagnostics: optional_commands.diagnostics,
         }
     }
 
-    fn collect_optional_commands(
-        &self,
+    fn optional_commands_snapshot(
+        &mut self,
         devices: &[BlockDevice],
-    ) -> (Vec<Zpool>, LvmSnapshot, Vec<SmartHealth>, Vec<String>) {
+        now: Instant,
+    ) -> OptionalCommandCache {
         if !self.optional_commands_enabled {
-            return (Vec::new(), LvmSnapshot::default(), Vec::new(), Vec::new());
+            return OptionalCommandCache::default();
         }
 
+        let device_names = optional_device_names(devices);
+        if self.optional_cache_is_fresh(&device_names, now) {
+            return self.optional_cache.clone();
+        }
+
+        let mut cache = self.collect_optional_commands(devices);
+        cache.device_names = device_names;
+        cache.collected_at = Some(now);
+        self.optional_cache = cache;
+        self.optional_cache.clone()
+    }
+
+    fn optional_cache_is_fresh(&self, device_names: &[String], now: Instant) -> bool {
+        if self.optional_cache.device_names != device_names {
+            return false;
+        }
+
+        let Some(collected_at) = self.optional_cache.collected_at else {
+            return false;
+        };
+
+        now.checked_duration_since(collected_at)
+            .is_some_and(|elapsed| elapsed < OPTIONAL_COMMAND_REFRESH_INTERVAL)
+    }
+
+    fn collect_optional_commands(&self, devices: &[BlockDevice]) -> OptionalCommandCache {
         let mut diagnostics = Vec::new();
 
         let (zfs, zfs_diagnostics) = zfs::collect(DEFAULT_COMMAND_TIMEOUT);
         diagnostics.extend(zfs_diagnostics);
+
+        let (mdadm_scan, mdadm_diagnostics) =
+            raid::collect_mdadm_detail_scan(DEFAULT_COMMAND_TIMEOUT);
+        diagnostics.extend(mdadm_diagnostics);
 
         let (lvm, lvm_diagnostics) = lvm::collect(DEFAULT_COMMAND_TIMEOUT);
         diagnostics.extend(lvm_diagnostics);
@@ -152,8 +199,29 @@ impl Sampler {
         let (smart, smart_diagnostics) = smart::collect(devices, DEFAULT_COMMAND_TIMEOUT);
         diagnostics.extend(smart_diagnostics);
 
-        (zfs, lvm, smart, diagnostics)
+        OptionalCommandCache {
+            zfs,
+            mdadm_scan,
+            lvm,
+            smart,
+            diagnostics,
+            device_names: Vec::new(),
+            collected_at: None,
+        }
     }
+}
+
+fn optional_device_names(devices: &[BlockDevice]) -> Vec<String> {
+    devices
+        .iter()
+        .filter(|device| {
+            matches!(
+                device.device_type.as_str(),
+                "disk" | "nvme" | "mmc" | "zbc" | "dm"
+            )
+        })
+        .map(|device| device.name.clone())
+        .collect()
 }
 
 fn hermetic_test_root(diskstats_path: &std::path::Path) -> PathBuf {
@@ -316,6 +384,50 @@ mod tests {
         assert_eq!(snapshot.devices[0].name, "sda");
         assert_eq!(snapshot.devices[0].size_bytes, 1_073_741_824);
         assert!(snapshot.filesystems.is_empty());
+    }
+
+    #[test]
+    fn sampler_reuses_cached_optional_commands_between_refreshes() {
+        let temp = TempDir::new().unwrap();
+        let diskstats = temp.path().join("diskstats");
+        let sys_block = temp.path().join("sys/block");
+        let mounts = temp.path().join("mounts");
+        let mdstat = temp.path().join("mdstat");
+        write(&diskstats, "");
+        write(&sys_block.join("sda/size"), "2097152\n");
+        write(&mounts, "");
+        write(
+            &mdstat,
+            "md0 : active raid1 sdb1[1] sda1[0]\n      1046528 blocks super 1.2 [2/2] [UU]\n",
+        );
+
+        let mut sampler = Sampler::new_for_tests_with_paths(diskstats, sys_block, mounts, mdstat);
+        sampler.optional_commands_enabled = true;
+        let started = Instant::now();
+        sampler.optional_cache = OptionalCommandCache {
+            zfs: vec![Zpool {
+                name: "tank".to_string(),
+                size: "1T".to_string(),
+                allocated: "100G".to_string(),
+                free: "900G".to_string(),
+                health: "ONLINE".to_string(),
+                status: None,
+            }],
+            mdadm_scan: vec!["ARRAY /dev/md0 metadata=1.2 UUID=abc name=host:0".to_string()],
+            diagnostics: vec!["cached optional data".to_string()],
+            device_names: vec!["sda".to_string()],
+            collected_at: Some(started),
+            ..OptionalCommandCache::default()
+        };
+
+        let snapshot = sampler.sample_at(started + Duration::from_secs(1));
+
+        assert_eq!(snapshot.zfs[0].name, "tank");
+        assert_eq!(
+            snapshot.mdraid[0].detail.as_deref(),
+            Some("ARRAY /dev/md0 metadata=1.2 UUID=abc name=host:0")
+        );
+        assert_eq!(snapshot.diagnostics, ["cached optional data"]);
     }
 
     fn assert_close(actual: f64, expected: f64) {

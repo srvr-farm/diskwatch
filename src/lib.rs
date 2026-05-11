@@ -21,7 +21,7 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::io;
+use std::io::{self, Write};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -42,8 +42,19 @@ fn run_once(interval: Duration) -> anyhow::Result<()> {
     let _ = sampler.sample();
     thread::sleep(interval);
     let snapshot = sampler.sample();
-    print!("{}", render::format_text_report(&snapshot));
+    write_once_report(&mut io::stdout(), &snapshot).context("write one-shot report")?;
     Ok(())
+}
+
+fn write_once_report<W>(writer: &mut W, snapshot: &crate::snapshot::Snapshot) -> io::Result<()>
+where
+    W: Write,
+{
+    match writer.write_all(render::format_text_report(snapshot).as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn run_tui(interval: Duration) -> anyhow::Result<()> {
@@ -142,6 +153,18 @@ mod tests {
         }
     }
 
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn should_quit_accepts_q_escape_and_ctrl_c() {
         assert!(should_quit(KeyCode::Char('q'), KeyModifiers::NONE));
@@ -161,5 +184,14 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert!(disable_raw_mode_called);
+    }
+
+    #[test]
+    fn once_report_treats_broken_pipe_as_clean_exit() {
+        let mut writer = BrokenPipeWriter;
+
+        let result = write_once_report(&mut writer, &crate::snapshot::Snapshot::default());
+
+        assert!(result.is_ok());
     }
 }

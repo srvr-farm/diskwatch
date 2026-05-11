@@ -15,7 +15,8 @@ Use `diskwatch` when you want to:
 - Monitor per-device read throughput, write throughput, read IOPS, write IOPS,
   and busy percentage from Linux disk statistics.
 - Inspect mounted filesystem capacity, including used, available, total, and
-  percent used.
+  percent used. Kernel pseudo filesystems are filtered, while capacity-bearing
+  mounts such as container overlay roots and tmpfs mounts are retained.
 - Inspect block-device inventory, including size, type, rotational hint, logical
   and physical sector size, vendor, model, and serial where readable.
 - Check ZFS pool capacity and health when `zpool` is installed.
@@ -80,11 +81,16 @@ non-interactive environments.
 LVM volumes, SMART settings, kernel tunables, or any other system
 configuration.
 
+Optional command output is cached for 30 seconds in the TUI so slower tools such
+as `zpool`, `mdadm`, LVM commands, or per-device `smartctl` checks do not run on
+every screen refresh. Core activity, filesystem, block-device, and `/proc/mdstat`
+data are still refreshed on the normal interval.
+
 ## Prerequisites
 
 Required for building:
 
-- A current stable Rust toolchain compatible with the crate's `rust-version`.
+- Rust 1.88 or newer, matching the crate's `rust-version`.
 - Cargo.
 
 Optional but recommended:

@@ -66,11 +66,11 @@ pub fn activity_between(
         return None;
     }
 
-    let sectors_read = curr.sectors_read.wrapping_sub(prev.sectors_read);
-    let sectors_written = curr.sectors_written.wrapping_sub(prev.sectors_written);
-    let reads_completed = curr.reads_completed.wrapping_sub(prev.reads_completed);
-    let writes_completed = curr.writes_completed.wrapping_sub(prev.writes_completed);
-    let io_time_ms = curr.io_time_ms.wrapping_sub(prev.io_time_ms);
+    let sectors_read = curr.sectors_read.checked_sub(prev.sectors_read)?;
+    let sectors_written = curr.sectors_written.checked_sub(prev.sectors_written)?;
+    let reads_completed = curr.reads_completed.checked_sub(prev.reads_completed)?;
+    let writes_completed = curr.writes_completed.checked_sub(prev.writes_completed)?;
+    let io_time_ms = curr.io_time_ms.checked_sub(prev.io_time_ms)?;
 
     Some(DiskActivity {
         name: curr.name.clone(),
@@ -141,5 +141,27 @@ mod tests {
         assert_eq!(activity.read_iops, Some(3.0));
         assert_eq!(activity.write_iops, Some(2.0));
         assert_eq!(activity.busy_percent, Some(10.0));
+    }
+
+    #[test]
+    fn skips_activity_when_diskstat_counters_reset() {
+        let prev = DiskStat {
+            name: "sda".to_string(),
+            reads_completed: 10,
+            sectors_read: 200,
+            writes_completed: 5,
+            sectors_written: 80,
+            io_time_ms: 40,
+        };
+        let curr = DiskStat {
+            name: "sda".to_string(),
+            reads_completed: 9,
+            sectors_read: 1224,
+            writes_completed: 9,
+            sectors_written: 592,
+            io_time_ms: 240,
+        };
+
+        assert_eq!(activity_between(&prev, &curr, Duration::from_secs(1)), None);
     }
 }

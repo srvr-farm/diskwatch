@@ -117,7 +117,7 @@ Create `Cargo.toml`:
 name = "diskwatch"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 
 [dependencies]
 anyhow = "1"
@@ -301,7 +301,7 @@ Implement:
 - `pub fn activity_between(prev: &DiskStat, curr: &DiskStat, elapsed: Duration) -> Option<DiskActivity>`
 - `pub fn activities_between(prev: &[DiskStat], curr: &[DiskStat], elapsed: Duration) -> Vec<DiskActivity>`
 
-Use field indexes from Linux diskstats after `major minor name`: reads completed at index 3, sectors read at index 5, writes completed at index 7, sectors written at index 9, I/O time in ms at index 12 in the full split row. Use `wrapping_sub` for counters and 512 bytes per sector.
+Use field indexes from Linux diskstats after `major minor name`: reads completed at index 3, sectors read at index 5, writes completed at index 7, sectors written at index 9, I/O time in ms at index 12 in the full split row. Use checked subtraction so counter resets or device recreation skip one interval instead of reporting wrapped deltas. Use 512 bytes per sector.
 
 - [ ] **Step 4: Wire activity into the snapshot**
 
@@ -488,7 +488,7 @@ Define `Mount`, `FsStats`, and `FilesystemUsage`. Implement:
 - `pub fn summarize_mount(mount: &Mount, stats: FsStats) -> FilesystemUsage`
 - `pub fn collect(mounts_path: &Path) -> Vec<FilesystemUsage>`
 
-Skip pseudo filesystems that are not useful for storage capacity in the main `collect`: `proc`, `sysfs`, `devtmpfs`, `devpts`, `tmpfs`, `cgroup`, `cgroup2`, `securityfs`, `pstore`, `bpf`, `tracefs`, `debugfs`, `configfs`, `fusectl`, `mqueue`, `hugetlbfs`, `autofs`, `overlay`.
+Skip pseudo filesystems that are not useful for storage capacity in the main `collect`: `proc`, `sysfs`, `devtmpfs`, `devpts`, `cgroup`, `cgroup2`, `securityfs`, `pstore`, `bpf`, `tracefs`, `debugfs`, `configfs`, `fusectl`, `mqueue`, `hugetlbfs`, `autofs`. Keep capacity-bearing mounts such as `tmpfs` and `overlay`.
 
 - [ ] **Step 4: Add filesystems to snapshot**
 
