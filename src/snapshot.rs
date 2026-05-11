@@ -1,15 +1,102 @@
+use crate::diskstats::{activities_between, read_diskstats, DiskActivity, DiskStat};
+use std::path::PathBuf;
+use std::time::Instant;
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
+    pub activity: Vec<DiskActivity>,
     pub diagnostics: Vec<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Sampler {
-    _private: (),
+    diskstats_path: PathBuf,
+    previous_diskstats: Vec<DiskStat>,
+    previous_at: Option<Instant>,
+}
+
+impl Default for Sampler {
+    fn default() -> Self {
+        Self {
+            diskstats_path: PathBuf::from("/proc/diskstats"),
+            previous_diskstats: Vec::new(),
+            previous_at: None,
+        }
+    }
 }
 
 impl Sampler {
+    pub fn new_for_tests(diskstats_path: PathBuf) -> Self {
+        Self {
+            diskstats_path,
+            previous_diskstats: Vec::new(),
+            previous_at: None,
+        }
+    }
+
     pub fn sample(&mut self) -> Snapshot {
-        Snapshot::default()
+        let now = Instant::now();
+        let current_diskstats = read_diskstats(&self.diskstats_path);
+        let activity = self
+            .previous_at
+            .map(|previous_at| {
+                activities_between(
+                    &self.previous_diskstats,
+                    &current_diskstats,
+                    now.duration_since(previous_at),
+                )
+            })
+            .unwrap_or_default();
+
+        self.previous_diskstats = current_diskstats;
+        self.previous_at = Some(now);
+
+        Snapshot {
+            activity,
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn sampler_reports_activity_from_diskstats_deltas() {
+        let file = NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            "   8       0 sda 10 0 200 30 5 0 80 20 0 40 50 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+
+        let mut sampler = Sampler::new_for_tests(file.path().to_path_buf());
+        assert!(sampler.sample().activity.is_empty());
+
+        fs::write(
+            file.path(),
+            "   8       0 sda 16 0 1224 30 9 0 592 20 0 240 50 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+
+        sampler.previous_at = sampler
+            .previous_at
+            .map(|previous_at| previous_at - std::time::Duration::from_secs(100));
+
+        let snapshot = sampler.sample();
+        assert_eq!(snapshot.activity.len(), 1);
+        assert_eq!(snapshot.activity[0].name, "sda");
+        assert_close(snapshot.activity[0].read_bytes_per_sec.unwrap(), 5_242.88);
+        assert_close(snapshot.activity[0].write_bytes_per_sec.unwrap(), 2_621.44);
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 64.0,
+            "expected {actual} to be close to {expected}"
+        );
     }
 }
