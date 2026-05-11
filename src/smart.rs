@@ -93,7 +93,14 @@ fn parse_wearout_percent(line: &str) -> Option<u64> {
         return last_integer(line);
     }
 
-    if lower.contains("percent_lifetime") || lower.contains("lifetime") && lower.contains("remain")
+    if lower.contains("percent_lifetime_used")
+        || lower.contains("lifetime") && lower.contains("used")
+    {
+        return last_integer(line);
+    }
+
+    if lower.contains("percent_lifetime")
+        || lower.contains("lifetime") && (lower.contains("remain") || lower.contains("left"))
     {
         return last_integer(line).map(remaining_to_used_percent);
     }
@@ -212,6 +219,24 @@ mod tests {
     #[test]
     fn parses_lifetime_remaining_as_used_percent() {
         let input = "Percent_Lifetime_Remain: 87%\n";
+
+        let health = parse_smartctl("/dev/sda", input);
+
+        assert_eq!(health.wearout_percent, Some(13));
+    }
+
+    #[test]
+    fn parses_lifetime_used_as_used_percent() {
+        let input = "Percent_Lifetime_Used: 2%\n";
+
+        let health = parse_smartctl("/dev/sda", input);
+
+        assert_eq!(health.wearout_percent, Some(2));
+    }
+
+    #[test]
+    fn parses_lifetime_left_as_used_percent() {
+        let input = "Percent_Lifetime_Left: 87%\n";
 
         let health = parse_smartctl("/dev/sda", input);
 

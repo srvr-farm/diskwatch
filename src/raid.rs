@@ -22,6 +22,11 @@ pub fn parse_mdstat(input: &str) -> Vec<MdArray> {
 
     for line in input.lines() {
         if let Some((name, rest)) = line.split_once(" : ") {
+            let name = name.trim();
+            if !name.starts_with("md") {
+                continue;
+            }
+
             if let Some(array) = current.take() {
                 arrays.push(array);
             }
@@ -38,7 +43,7 @@ pub fn parse_mdstat(input: &str) -> Vec<MdArray> {
                 .collect();
 
             current = Some(MdArray {
-                name: name.trim().to_string(),
+                name: name.to_string(),
                 level,
                 devices,
                 status: None,
@@ -100,6 +105,17 @@ mod tests {
         assert_eq!(arrays[0].name, "md0");
         assert_eq!(arrays[0].level.as_deref(), Some("raid1"));
         assert_eq!(arrays[0].status.as_deref(), Some("[UU]"));
+    }
+
+    #[test]
+    fn skips_mdstat_headers_and_unused_devices() {
+        let input = "Personalities : [raid1] [raid6]\nmd0 : active raid1 sdb1[1] sda1[0]\n      1046528 blocks super 1.2 [2/2] [UU]\nmd1 : active raid5 sdc1[0] sdd1[1]\n      2093056 blocks super 1.2 [2/2] [UU]\nunused devices: <none>\n";
+
+        let arrays = parse_mdstat(input);
+
+        assert_eq!(arrays.len(), 2);
+        assert_eq!(arrays[0].name, "md0");
+        assert_eq!(arrays[1].name, "md1");
     }
 
     #[test]
