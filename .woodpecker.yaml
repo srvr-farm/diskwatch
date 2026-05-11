@@ -1,0 +1,122 @@
+when:
+  - event: [push, pull_request, tag, manual]
+
+clone:
+  - name: git
+    image: woodpeckerci/plugin-git:2.9.0
+    network_mode: woodpecker-ci_default
+    settings:
+      attempts: 10
+      backoff: 10s
+      lfs: false
+      recursive: false
+
+steps:
+  - name: check
+    image: rust:1-bookworm
+    network_mode: woodpecker-ci_default
+    commands:
+      - rustup component add rustfmt clippy
+      - make check
+
+  - name: build-release-binary
+    image: rust:1-bookworm
+    network_mode: woodpecker-ci_default
+    depends_on:
+      - check
+    commands:
+      - make build
+      - mkdir -p dist
+      - |
+        set -e
+        tag="$${CI_COMMIT_TAG:-}"
+        if [ -n "$$tag" ]; then
+          version="$$(printf '%s' "$$tag" | sed 's/^diskwatch-//; s/^v//')"
+        else
+          version="0.1.$${CI_PIPELINE_NUMBER:-0}"
+        fi
+        release_ref="$${tag:-v$${version}}"
+        artifact="diskwatch-$${version}-linux-x86_64"
+        cp target/release/diskwatch "dist/$$artifact"
+        chmod 0755 "dist/$$artifact"
+        sha256sum "dist/$$artifact" > "dist/$$artifact.sha256"
+        deb="diskwatch_$${version}_amd64.deb"
+        rpm="diskwatch-$${version}-1.x86_64.rpm"
+        if [ -n "$$tag" ]; then
+          if ! command -v rpmbuild >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y --no-install-recommends rpm
+          fi
+          make package VERSION="$$version" PACKAGE_OUTPUT_DIR=dist
+          make check-packages VERSION="$$version" PACKAGE_OUTPUT_DIR=dist
+        fi
+        cat > dist/RELEASE_NOTES.md <<EOF
+        Automated Woodpecker release.
+
+        - Repository: $${CI_REPO}
+        - Version: $${release_ref}
+        - Commit: $${CI_COMMIT_SHA}
+        - Pipeline: $${CI_PIPELINE_NUMBER}
+        - Binary: $${artifact}
+        - Debian package: $${deb}
+        - RPM package: $${rpm}
+        EOF
+      - ls -lh dist
+
+  - name: create-release-tag
+    image: rust:1-bookworm
+    network_mode: woodpecker-ci_default
+    depends_on:
+      - build-release-binary
+    environment:
+      GITHUB_TOKEN:
+        from_secret: RELEASE_TOKEN
+    commands:
+      - |
+        set -e
+        tag="v0.1.$${CI_PIPELINE_NUMBER}"
+        if [ -z "$${GITHUB_TOKEN:-}" ]; then
+          echo "RELEASE_TOKEN secret is required to push $$tag"
+          exit 1
+        fi
+        git config user.name "woodpecker-ci"
+        git config user.email "woodpecker-ci@srvr.farm"
+        if git ls-remote --exit-code --tags origin "refs/tags/$$tag" >/dev/null 2>&1; then
+          echo "Tag $$tag already exists; skipping"
+          exit 0
+        fi
+        git tag -a "$$tag" -m "Release $$tag"
+        cat > .git/askpass.sh <<'EOF'
+        #!/bin/sh
+        case "$$1" in
+          *Username*) printf '%s\n' x-access-token ;;
+          *Password*) printf '%s\n' "$$GITHUB_TOKEN" ;;
+          *) printf '\n' ;;
+        esac
+        EOF
+        chmod 0700 .git/askpass.sh
+        trap 'rm -f .git/askpass.sh' EXIT
+        GIT_ASKPASS="$${PWD}/.git/askpass.sh" GIT_TERMINAL_PROMPT=0 git push "https://github.com/$${CI_REPO}.git" "$$tag"
+    when:
+      - event: push
+        branch: master
+
+  - name: publish-release
+    image: woodpeckerci/plugin-release
+    network_mode: woodpecker-ci_default
+    depends_on:
+      - build-release-binary
+    settings:
+      api_key:
+        from_secret: RELEASE_TOKEN
+      files:
+        - dist/*-linux-x86_64
+        - dist/*-linux-x86_64.sha256
+        - dist/*.deb
+        - dist/*.deb.sha256
+        - dist/*.rpm
+        - dist/*.rpm.sha256
+      file-exists: overwrite
+      note: dist/RELEASE_NOTES.md
+    when:
+      - event: tag

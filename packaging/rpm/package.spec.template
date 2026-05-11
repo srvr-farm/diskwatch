@@ -1,0 +1,35 @@
+%global debug_package %{nil}
+
+Name: @BIN@
+Version: @VERSION@
+Release: @RPM_RELEASE@
+Summary: @SUMMARY@
+License: LicenseRef-Unknown
+URL: @URL@
+BuildArch: @RPM_ARCH@
+Requires: libcap
+Requires(post): libcap
+
+%description
+@DESCRIPTION@
+
+%prep
+
+%build
+
+%install
+rm -rf %{buildroot}
+mkdir -p %{buildroot}/usr/bin
+install -m 0755 @BUILD_BIN@ %{buildroot}/usr/bin/@BIN@
+
+%post
+chmod 0755 /usr/bin/@BIN@
+if command -v setcap >/dev/null 2>&1; then
+  setcap @CAPABILITY@ /usr/bin/@BIN@
+else
+  echo "setcap is required to set @CAPABILITY@ on /usr/bin/@BIN@" >&2
+  exit 1
+fi
+
+%files
+%attr(0755,root,root) /usr/bin/@BIN@

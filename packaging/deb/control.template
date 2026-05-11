@@ -1,0 +1,10 @@
+Package: @BIN@
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @DEB_ARCH@
+Maintainer: @MAINTAINER@
+Depends: libcap2-bin
+Homepage: @URL@
+Description: @SUMMARY@
+ @DESCRIPTION@
