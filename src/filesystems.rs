@@ -84,16 +84,16 @@ pub fn stat_mount(path: &Path) -> Option<FsStats> {
     }
 
     let stats = unsafe { stats.assume_init() };
-    let fragment_size = stats.f_frsize as u64;
+    let fragment_size = stats.f_frsize;
     Some(FsStats {
         block_size: if fragment_size == 0 {
-            stats.f_bsize as u64
+            stats.f_bsize
         } else {
             fragment_size
         },
-        blocks: stats.f_blocks as u64,
-        blocks_available: stats.f_bavail as u64,
-        blocks_free: stats.f_bfree as u64,
+        blocks: stats.f_blocks,
+        blocks_available: stats.f_bavail,
+        blocks_free: stats.f_bfree,
     })
 }
 
@@ -157,6 +157,7 @@ fn unescape_mount_field(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn parses_proc_mounts_with_escaped_spaces() {
@@ -188,5 +189,74 @@ mod tests {
         assert_eq!(summary.available_bytes, 1_024_000);
         assert_eq!(summary.used_bytes, 2_867_200);
         assert_eq!(summary.used_percent, Some(70.0));
+    }
+
+    #[test]
+    fn ignores_malformed_mount_lines() {
+        let input = "not-enough-fields\n/dev/sda1 / ext4 rw,relatime 0 0\nmissing fs-type\n";
+
+        let mounts = parse_mounts(input);
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].source, "/dev/sda1");
+    }
+
+    #[test]
+    fn zero_block_filesystem_has_no_used_percent() {
+        let mount = Mount {
+            source: "/dev/empty".to_string(),
+            mountpoint: "/empty".to_string(),
+            fs_type: "ext4".to_string(),
+        };
+
+        let summary = summarize_mount(
+            &mount,
+            FsStats {
+                block_size: 4096,
+                blocks: 0,
+                blocks_available: 0,
+                blocks_free: 0,
+            },
+        );
+
+        assert_eq!(summary.total_bytes, 0);
+        assert_eq!(summary.used_percent, None);
+    }
+
+    #[test]
+    fn collect_skips_pseudo_filesystem_types() {
+        let mountpoint = TempDir::new().unwrap();
+        let mounts = TempDir::new().unwrap();
+        let mounts_path = mounts.path().join("mounts");
+        std::fs::write(
+            &mounts_path,
+            format!(
+                "proc {} proc rw 0 0\ntmpfs {} tmpfs rw 0 0\noverlay {} overlay rw 0 0\n",
+                mountpoint.path().display(),
+                mountpoint.path().display(),
+                mountpoint.path().display()
+            ),
+        )
+        .unwrap();
+
+        let filesystems = collect(&mounts_path);
+
+        assert!(filesystems.is_empty());
+    }
+
+    #[test]
+    fn collect_skips_unavailable_mountpoints() {
+        let mounts = TempDir::new().unwrap();
+        let mounts_path = mounts.path().join("mounts");
+        let unavailable = mounts.path().join("does-not-exist");
+        std::fs::write(
+            &mounts_path,
+            format!("/dev/sda1 {} ext4 rw 0 0\n", unavailable.display()),
+        )
+        .unwrap();
+
+        let filesystems = collect(&mounts_path);
+
+        assert!(filesystems.is_empty());
     }
 }

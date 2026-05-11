@@ -39,10 +39,22 @@ impl Sampler {
     }
 
     pub fn new_for_tests_with_roots(diskstats_path: PathBuf, sys_block_root: PathBuf) -> Self {
+        Self::new_for_tests_with_roots_and_mounts(
+            diskstats_path,
+            sys_block_root,
+            PathBuf::from("/nonexistent-diskwatch-test-mounts"),
+        )
+    }
+
+    pub fn new_for_tests_with_roots_and_mounts(
+        diskstats_path: PathBuf,
+        sys_block_root: PathBuf,
+        mounts_path: PathBuf,
+    ) -> Self {
         Self {
             diskstats_path,
             sys_block_root,
-            mounts_path: PathBuf::from("/proc/mounts"),
+            mounts_path,
             previous_diskstats: Vec::new(),
             previous_at: None,
         }
@@ -85,15 +97,17 @@ mod tests {
     fn sampler_reports_activity_from_diskstats_deltas() {
         let file = NamedTempFile::new().unwrap();
         let sys_block = TempDir::new().unwrap();
+        let mounts = NamedTempFile::new().unwrap();
         fs::write(
             file.path(),
             "   8       0 sda 10 0 200 30 5 0 80 20 0 40 50 0 0 0 0 0 0\n",
         )
         .unwrap();
 
-        let mut sampler = Sampler::new_for_tests_with_roots(
+        let mut sampler = Sampler::new_for_tests_with_roots_and_mounts(
             file.path().to_path_buf(),
             sys_block.path().to_path_buf(),
+            mounts.path().to_path_buf(),
         );
         assert!(sampler.sample().activity.is_empty());
 
@@ -118,19 +132,22 @@ mod tests {
     fn sampler_reports_block_device_inventory() {
         let diskstats = NamedTempFile::new().unwrap();
         let sys_block = TempDir::new().unwrap();
+        let mounts = NamedTempFile::new().unwrap();
         let sda = sys_block.path().join("sda");
         fs::create_dir_all(&sda).unwrap();
         fs::write(sda.join("size"), "2097152\n").unwrap();
 
-        let mut sampler = Sampler::new_for_tests_with_roots(
+        let mut sampler = Sampler::new_for_tests_with_roots_and_mounts(
             diskstats.path().to_path_buf(),
             sys_block.path().to_path_buf(),
+            mounts.path().to_path_buf(),
         );
 
         let snapshot = sampler.sample();
         assert_eq!(snapshot.devices.len(), 1);
         assert_eq!(snapshot.devices[0].name, "sda");
         assert_eq!(snapshot.devices[0].size_bytes, 1_073_741_824);
+        assert!(snapshot.filesystems.is_empty());
     }
 
     fn assert_close(actual: f64, expected: f64) {
