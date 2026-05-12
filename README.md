@@ -21,7 +21,9 @@ Use `diskwatch` when you want to:
   to avoid blocking on stale network filesystems.
 - Inspect block-device inventory, including size, type, rotational hint, logical
   and physical sector size, vendor, model, and serial where readable.
-- Check ZFS pool capacity and health when `zpool` is installed.
+- Check ZFS pool capacity and health when `zpool` is installed. Use
+  `--zfs-deep` for topology, vdev I/O, ARC/L2ARC, dataset, and kernel kstat
+  summaries.
 - Check mdraid array state from `/proc/mdstat` and optional `mdadm` output.
 - Check LVM physical volumes, volume groups, and logical volumes when LVM tools
   are installed.
@@ -76,6 +78,7 @@ non-interactive environments.
 | mdraid state | `/proc/mdstat` |
 | mdraid details | `mdadm --detail --scan` |
 | ZFS pools | `zpool list` and `zpool status` |
+| Deep ZFS stats | `zpool iostat`, `zfs list`, `zfs get`, and `/proc/spl/kstat/zfs` |
 | LVM state | `pvs`, `vgs`, and `lvs` |
 | SMART health | `smartctl` |
 
@@ -88,6 +91,12 @@ a short aggregate budget so slower tools such as `zpool`, `mdadm`, LVM commands,
 or per-device `smartctl` checks cannot multiply into long UI stalls. Core
 activity, filesystem, block-device, and `/proc/mdstat` data are still refreshed
 on the normal interval.
+
+Deep ZFS mode has its own bounded ZFS collection budget. It may spend about one
+second sampling `zpool iostat -y 1 1` so the displayed vdev rates and latency
+fields represent a real interval. If a ZFS source is too slow, unavailable, or
+blocked by permissions, `diskwatch` keeps the partial data it has and reports a
+source-specific diagnostic instead of failing the whole report.
 
 Mounted filesystem capacity uses synchronous local `statvfs` calls. Remote and
 FUSE filesystem types such as NFS, CIFS, sshfs, and similar mounts are skipped
@@ -326,6 +335,28 @@ zpool status
 If ZFS is not installed or no pools are present, the ZFS section reports `N/A`
 and includes a diagnostic when useful.
 
+For deeper ZFS reporting, run:
+
+```sh
+diskwatch --zfs-deep
+diskwatch --once --zfs-deep
+```
+
+Deep ZFS mode collects:
+
+- Pool capacity, health, scan, error, action, and topology from `zpool list`
+  and `zpool status -P`.
+- Vdev read/write rates, IOPS, latency, and queue counters from one bounded
+  `zpool iostat -Hp -vlq -y <pools> 1 1` command.
+- Dataset usage and selected properties from scoped `zfs list` and `zfs get`
+  commands for the detected pools.
+- ARC, L2ARC, dbuf, dnode, ZIL, zfetch, ABD, and recent TXG summaries from
+  `/proc/spl/kstat/zfs` when readable.
+
+Permission failures and missing kstat files degrade to diagnostics and `N/A`
+fields. The command never changes pool state, starts scrubs, clears errors, or
+modifies ZFS properties.
+
 ### mdraid
 
 mdraid state is read from:
@@ -457,6 +488,7 @@ Options:
       --once
       --loop
       --tmpfs
+      --zfs-deep
   -h, --help                 Print help
 ```
 
@@ -477,7 +509,7 @@ kernel storage settings.
 - `src/block.rs`: `/sys/block` inventory and block-device metadata.
 - `src/filesystems.rs`: mount parsing and filesystem capacity.
 - `src/raid.rs`: `/proc/mdstat` and optional `mdadm` parsing.
-- `src/zfs.rs`: optional `zpool` parsing.
+- `src/zfs.rs`: optional ZFS command and kstat parsing.
 - `src/lvm.rs`: optional LVM command parsing.
 - `src/smart.rs`: optional `smartctl` parsing.
 - `src/commands.rs`: timeout-aware helper for optional read-only commands.
