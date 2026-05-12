@@ -703,24 +703,29 @@ fn attach_iostat_rows(pools: &mut [ZfsPool], rows: Vec<ZfsVdevIo>) {
 
 fn collect_kstats(kstat_root: &Path, pools: &[ZfsPool]) -> (ZfsKernelStats, Vec<String>) {
     let mut diagnostics = Vec::new();
-    let mut kernel = ZfsKernelStats::default();
-
-    kernel.dbuf = read_optional_kstat(kstat_root, "dbufstats", KSTAT_FILE_LIMIT, &mut diagnostics)
+    let dbuf = read_optional_kstat(kstat_root, "dbufstats", KSTAT_FILE_LIMIT, &mut diagnostics)
         .and_then(|input| parse_dbufstats(&input));
-    kernel.dnode =
-        read_optional_kstat(kstat_root, "dnodestats", KSTAT_FILE_LIMIT, &mut diagnostics)
-            .and_then(|input| parse_dnodestats(&input));
-    kernel.zil = read_optional_kstat(kstat_root, "zil", KSTAT_FILE_LIMIT, &mut diagnostics)
+    let dnode = read_optional_kstat(kstat_root, "dnodestats", KSTAT_FILE_LIMIT, &mut diagnostics)
+        .and_then(|input| parse_dnodestats(&input));
+    let zil = read_optional_kstat(kstat_root, "zil", KSTAT_FILE_LIMIT, &mut diagnostics)
         .and_then(|input| parse_zil(&input));
-    kernel.zfetch = read_optional_kstat(
+    let zfetch = read_optional_kstat(
         kstat_root,
         "zfetchstats",
         KSTAT_FILE_LIMIT,
         &mut diagnostics,
     )
     .and_then(|input| parse_zfetchstats(&input));
-    kernel.abd = read_optional_kstat(kstat_root, "abdstats", KSTAT_FILE_LIMIT, &mut diagnostics)
+    let abd = read_optional_kstat(kstat_root, "abdstats", KSTAT_FILE_LIMIT, &mut diagnostics)
         .and_then(|input| parse_abdstats(&input));
+    let mut kernel = ZfsKernelStats {
+        dbuf,
+        dnode,
+        zil,
+        zfetch,
+        abd,
+        ..ZfsKernelStats::default()
+    };
 
     for pool in pools {
         let relative = format!("{}/txgs", pool.name);
@@ -1103,13 +1108,14 @@ pub fn parse_abdstats(input: &str) -> Option<AbdStats> {
 pub fn parse_txgs(input: &str) -> Option<TxgSummary> {
     let fields: Vec<_> = input
         .lines()
+        .rev()
         .filter(|line| !line.trim().is_empty())
         .filter(|line| !line.trim_start().starts_with("txg "))
         .filter_map(|line| {
             let fields: Vec<_> = line.split_whitespace().collect();
             (fields.len() >= 8).then_some(fields)
         })
-        .last()?;
+        .next()?;
 
     Some(TxgSummary {
         latest_txg: parse_optional_u64(fields[0]),
