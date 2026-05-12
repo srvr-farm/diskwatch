@@ -305,24 +305,62 @@ fn storage_name_priority(name: &str) -> u8 {
 }
 
 fn write_zfs_lines(output: &mut String, snapshot: &Snapshot, indent: &str) {
-    if snapshot.zfs.is_empty() {
+    if snapshot.zfs.pools.is_empty() {
         writeln!(output, "{indent}N/A").unwrap();
         return;
     }
 
-    for pool in &snapshot.zfs {
-        writeln!(
+    for pool in &snapshot.zfs.pools {
+        writeln!(output, "{indent}{}", pool.name).unwrap();
+        write_zfs_field(output, indent, "health:", &pool.health);
+        write_zfs_field(
             output,
-            "{indent}{} size={} allocated={} free={} health={} status={}",
-            pool.name,
-            pool.size,
-            pool.allocated,
-            pool.free,
-            pool.health,
-            format_optional(pool.status.as_deref())
-        )
-        .unwrap();
+            indent,
+            "size:",
+            &format_optional_bytes(pool.size_bytes),
+        );
+        write_zfs_field(
+            output,
+            indent,
+            "allocated:",
+            &format_optional_bytes(pool.allocated_bytes),
+        );
+        write_zfs_field(
+            output,
+            indent,
+            "free:",
+            &format_optional_bytes(pool.free_bytes),
+        );
+        write_zfs_field(
+            output,
+            indent,
+            "capacity:",
+            &format_percent(pool.capacity_percent),
+        );
+        write_zfs_field(
+            output,
+            indent,
+            "fragmentation:",
+            &format_percent(pool.fragmentation_percent),
+        );
+        write_zfs_field(output, indent, "dedup:", &format_ratio(pool.dedup_ratio));
+        if let Some(status) = pool.status.as_deref() {
+            write_zfs_field(output, indent, "status:", status);
+        }
+        if let Some(action) = pool.action.as_deref() {
+            write_zfs_field(output, indent, "action:", action);
+        }
+        if let Some(scan) = pool.scan.as_deref() {
+            write_zfs_field(output, indent, "scan:", scan);
+        }
+        if let Some(errors) = pool.errors.as_deref() {
+            write_zfs_field(output, indent, "errors:", errors);
+        }
     }
+}
+
+fn write_zfs_field(output: &mut String, indent: &str, label: &str, value: &str) {
+    writeln!(output, "{indent}  {label:<14} {value}").unwrap();
 }
 
 fn write_mdraid_lines(output: &mut String, snapshot: &Snapshot, indent: &str) {
@@ -469,6 +507,16 @@ fn format_percent(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.1}%"))
         .unwrap_or_else(|| "N/A".to_string())
+}
+
+fn format_ratio(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.2}x"))
+        .unwrap_or_else(|| "N/A".to_string())
+}
+
+fn format_optional_bytes(value: Option<u64>) -> String {
+    value.map(format_bytes).unwrap_or_else(|| "N/A".to_string())
 }
 
 fn format_optional(value: Option<&str>) -> &str {

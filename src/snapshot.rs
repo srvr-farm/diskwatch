@@ -5,7 +5,7 @@ use crate::filesystems::{collect as collect_filesystems, FilesystemUsage};
 use crate::lvm::{self, LvmSnapshot};
 use crate::raid::{self, read_mdstat, MdArray};
 use crate::smart::{self, SmartHealth};
-use crate::zfs::{self, Zpool};
+use crate::zfs::{self, ZfsSnapshot};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -22,7 +22,7 @@ pub struct Snapshot {
     pub filesystems: Vec<FilesystemUsage>,
     pub devices: Vec<BlockDevice>,
     pub mdraid: Vec<MdArray>,
-    pub zfs: Vec<Zpool>,
+    pub zfs: ZfsSnapshot,
     pub lvm: LvmSnapshot,
     pub smart: Vec<SmartHealth>,
     pub diagnostics: Vec<String>,
@@ -37,7 +37,7 @@ pub struct DisplayOptions {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct OptionalCommandCache {
-    zfs: Vec<Zpool>,
+    zfs: ZfsSnapshot,
     mdadm_scan: Vec<String>,
     lvm: LvmSnapshot,
     smart: Vec<SmartHealth>,
@@ -323,7 +323,7 @@ fn is_loop_filesystem(filesystem: &FilesystemUsage) -> bool {
 }
 
 fn optional_cache(
-    zfs: Vec<Zpool>,
+    zfs: ZfsSnapshot,
     mdadm_scan: Vec<String>,
     lvm: LvmSnapshot,
     smart: Vec<SmartHealth>,
@@ -381,6 +381,7 @@ fn hermetic_test_root(diskstats_path: &std::path::Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zfs::ZfsPool;
     use std::fs;
     use std::path::Path;
     use std::time::Duration;
@@ -432,7 +433,7 @@ mod tests {
         assert_eq!(first.mdraid[0].name, "md0");
         assert_eq!(first.mdraid[0].level.as_deref(), Some("raid1"));
         assert_eq!(first.mdraid[0].status.as_deref(), Some("[UU]"));
-        assert!(first.zfs.is_empty());
+        assert!(first.zfs.pools.is_empty());
         assert_eq!(first.lvm, LvmSnapshot::default());
         assert!(first.smart.is_empty());
         assert!(first.diagnostics.is_empty());
@@ -449,7 +450,7 @@ mod tests {
         assert_eq!(second.devices[0].name, "sda");
         assert_eq!(second.filesystems[0].source, "/dev/sda1");
         assert_eq!(second.mdraid[0].name, "md0");
-        assert!(second.zfs.is_empty());
+        assert!(second.zfs.pools.is_empty());
         assert_eq!(second.lvm, LvmSnapshot::default());
         assert!(second.smart.is_empty());
         assert!(second.diagnostics.is_empty());
@@ -465,7 +466,7 @@ mod tests {
         assert!(snapshot.devices.is_empty());
         assert!(snapshot.filesystems.is_empty());
         assert!(snapshot.mdraid.is_empty());
-        assert!(snapshot.zfs.is_empty());
+        assert!(snapshot.zfs.pools.is_empty());
         assert_eq!(snapshot.lvm, LvmSnapshot::default());
         assert!(snapshot.smart.is_empty());
         assert!(snapshot.diagnostics.is_empty());
@@ -738,14 +739,14 @@ mod tests {
         sampler.optional_commands_enabled = true;
         let started = Instant::now();
         sampler.optional_cache = OptionalCommandCache {
-            zfs: vec![Zpool {
-                name: "tank".to_string(),
-                size: "1T".to_string(),
-                allocated: "100G".to_string(),
-                free: "900G".to_string(),
-                health: "ONLINE".to_string(),
-                status: None,
-            }],
+            zfs: ZfsSnapshot {
+                pools: vec![ZfsPool {
+                    name: "tank".to_string(),
+                    health: "ONLINE".to_string(),
+                    ..ZfsPool::default()
+                }],
+                ..ZfsSnapshot::default()
+            },
             mdadm_scan: vec!["ARRAY /dev/md0 metadata=1.2 UUID=abc name=host:0".to_string()],
             diagnostics: vec!["cached optional data".to_string()],
             device_names: vec!["sda".to_string()],
@@ -755,7 +756,7 @@ mod tests {
 
         let snapshot = sampler.sample_at(started + Duration::from_secs(1));
 
-        assert_eq!(snapshot.zfs[0].name, "tank");
+        assert_eq!(snapshot.zfs.pools[0].name, "tank");
         assert_eq!(
             snapshot.mdraid[0].detail.as_deref(),
             Some("ARRAY /dev/md0 metadata=1.2 UUID=abc name=host:0")
@@ -793,7 +794,7 @@ mod tests {
 
         let snapshot = sampler.sample_at_with_optional(Instant::now(), false);
 
-        assert!(snapshot.zfs.is_empty());
+        assert!(snapshot.zfs.pools.is_empty());
         assert!(snapshot.diagnostics.is_empty());
     }
 
