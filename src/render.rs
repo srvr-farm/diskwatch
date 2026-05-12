@@ -305,7 +305,7 @@ fn storage_name_priority(name: &str) -> u8 {
 }
 
 fn write_zfs_lines(output: &mut String, snapshot: &Snapshot, indent: &str) {
-    if snapshot.zfs.pools.is_empty() {
+    if snapshot.zfs.pools.is_empty() && snapshot.zfs.arc.is_none() {
         writeln!(output, "{indent}N/A").unwrap();
         return;
     }
@@ -356,6 +356,17 @@ fn write_zfs_lines(output: &mut String, snapshot: &Snapshot, indent: &str) {
         if let Some(errors) = pool.errors.as_deref() {
             write_zfs_field(output, indent, "errors:", errors);
         }
+    }
+    if let Some(arc) = snapshot.zfs.arc.as_ref() {
+        writeln!(
+            output,
+            "{indent}arc: hit={} size={} l2_hit={} l2_size={}",
+            format_percent(arc.hit_ratio_percent),
+            format_optional_bytes(arc.size_bytes),
+            format_percent(arc.l2_hit_ratio_percent),
+            format_optional_bytes(arc.l2_size_bytes)
+        )
+        .unwrap();
     }
 }
 

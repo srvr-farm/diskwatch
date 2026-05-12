@@ -2,6 +2,8 @@ use crate::commands;
 use std::collections::HashMap;
 use std::time::Duration;
 
+pub type KstatMap = HashMap<String, u64>;
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ZfsSnapshot {
     pub deep: bool,
@@ -64,7 +66,43 @@ pub enum ZfsTopologyRole {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct ArcStats;
+pub struct ArcStats {
+    pub raw: KstatMap,
+    pub hit_ratio_percent: Option<f64>,
+    pub miss_ratio_percent: Option<f64>,
+    pub demand_data_hit_ratio_percent: Option<f64>,
+    pub demand_metadata_hit_ratio_percent: Option<f64>,
+    pub prefetch_data_hit_ratio_percent: Option<f64>,
+    pub prefetch_metadata_hit_ratio_percent: Option<f64>,
+    pub size_bytes: Option<u64>,
+    pub target_bytes: Option<u64>,
+    pub min_bytes: Option<u64>,
+    pub max_bytes: Option<u64>,
+    pub compressed_size_bytes: Option<u64>,
+    pub uncompressed_size_bytes: Option<u64>,
+    pub data_size_bytes: Option<u64>,
+    pub metadata_size_bytes: Option<u64>,
+    pub dbuf_size_bytes: Option<u64>,
+    pub dnode_size_bytes: Option<u64>,
+    pub mru_size_bytes: Option<u64>,
+    pub mfu_size_bytes: Option<u64>,
+    pub l2_hit_ratio_percent: Option<f64>,
+    pub l2_size_bytes: Option<u64>,
+    pub l2_asize_bytes: Option<u64>,
+    pub l2_read_bytes: Option<u64>,
+    pub l2_write_bytes: Option<u64>,
+    pub l2_writes_sent: Option<u64>,
+    pub l2_writes_done: Option<u64>,
+    pub l2_writes_error: Option<u64>,
+    pub l2_cksum_bad: Option<u64>,
+    pub l2_io_error: Option<u64>,
+    pub memory_all_bytes: Option<u64>,
+    pub memory_free_bytes: Option<u64>,
+    pub memory_available_bytes: Option<u64>,
+    pub memory_throttle_count: Option<u64>,
+    pub memory_direct_count: Option<u64>,
+    pub memory_indirect_count: Option<u64>,
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ZfsDataset;
@@ -410,6 +448,91 @@ fn parse_optional_u64(value: &str) -> Option<u64> {
     }
 }
 
+pub fn parse_kstat_map(input: &str) -> KstatMap {
+    input
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let name = fields.next()?;
+            let _kind = fields.next()?;
+            let data = fields.next()?;
+            let value = data.parse().ok()?;
+            Some((name.to_string(), value))
+        })
+        .collect()
+}
+
+pub fn parse_arcstats(input: &str) -> Option<ArcStats> {
+    let raw = parse_kstat_map(input);
+    Some(ArcStats {
+        hit_ratio_percent: ratio_from_keys(&raw, "hits", "misses"),
+        miss_ratio_percent: ratio_from_keys(&raw, "misses", "hits"),
+        demand_data_hit_ratio_percent: ratio_from_keys(
+            &raw,
+            "demand_data_hits",
+            "demand_data_misses",
+        ),
+        demand_metadata_hit_ratio_percent: ratio_from_keys(
+            &raw,
+            "demand_metadata_hits",
+            "demand_metadata_misses",
+        ),
+        prefetch_data_hit_ratio_percent: ratio_from_keys(
+            &raw,
+            "prefetch_data_hits",
+            "prefetch_data_misses",
+        ),
+        prefetch_metadata_hit_ratio_percent: ratio_from_keys(
+            &raw,
+            "prefetch_metadata_hits",
+            "prefetch_metadata_misses",
+        ),
+        size_bytes: raw.get("size").copied(),
+        target_bytes: raw.get("c").copied(),
+        min_bytes: raw.get("c_min").copied(),
+        max_bytes: raw.get("c_max").copied(),
+        compressed_size_bytes: raw.get("compressed_size").copied(),
+        uncompressed_size_bytes: raw.get("uncompressed_size").copied(),
+        data_size_bytes: raw.get("data_size").copied(),
+        metadata_size_bytes: raw.get("metadata_size").copied(),
+        dbuf_size_bytes: raw.get("dbuf_size").copied(),
+        dnode_size_bytes: raw.get("dnode_size").copied(),
+        mru_size_bytes: raw.get("mru_size").copied(),
+        mfu_size_bytes: raw.get("mfu_size").copied(),
+        l2_hit_ratio_percent: ratio_from_keys(&raw, "l2_hits", "l2_misses"),
+        l2_size_bytes: raw.get("l2_size").copied(),
+        l2_asize_bytes: raw.get("l2_asize").copied(),
+        l2_read_bytes: raw.get("l2_read_bytes").copied(),
+        l2_write_bytes: raw.get("l2_write_bytes").copied(),
+        l2_writes_sent: raw.get("l2_writes_sent").copied(),
+        l2_writes_done: raw.get("l2_writes_done").copied(),
+        l2_writes_error: raw.get("l2_writes_error").copied(),
+        l2_cksum_bad: raw.get("l2_cksum_bad").copied(),
+        l2_io_error: raw.get("l2_io_error").copied(),
+        memory_all_bytes: raw.get("memory_all_bytes").copied(),
+        memory_free_bytes: raw.get("memory_free_bytes").copied(),
+        memory_available_bytes: raw.get("memory_available_bytes").copied(),
+        memory_throttle_count: raw.get("memory_throttle_count").copied(),
+        memory_direct_count: raw.get("memory_direct_count").copied(),
+        memory_indirect_count: raw.get("memory_indirect_count").copied(),
+        raw,
+    })
+}
+
+fn ratio_from_keys(stats: &KstatMap, numerator_key: &str, other_key: &str) -> Option<f64> {
+    let numerator = *stats.get(numerator_key)?;
+    let other = *stats.get(other_key)?;
+    ratio_percent(numerator, numerator.checked_add(other)?)
+}
+
+fn ratio_percent(numerator: u64, denominator: u64) -> Option<f64> {
+    if denominator == 0 {
+        None
+    } else {
+        Some((numerator as f64 / denominator as f64) * 100.0)
+    }
+}
+
 fn parse_percent(value: &str) -> Option<f64> {
     let trimmed = value.trim().trim_end_matches('%');
     if trimmed.is_empty() || trimmed == "-" {
@@ -541,5 +664,92 @@ errors: No known data errors
 
         assert!(snapshot.pools.is_empty());
         assert_eq!(diagnostics, ["zpool not found"]);
+    }
+
+    #[test]
+    fn parses_kstat_name_type_data_rows() {
+        let input = "\
+9 1 0x01 147 39984 4452996882 165618915963102
+name                            type data
+hits                            4    90
+misses                          4    10
+size                            4    1024
+l2_hits                         4    5
+";
+        let stats = parse_kstat_map(input);
+
+        assert_eq!(stats.get("hits"), Some(&90));
+        assert_eq!(stats.get("misses"), Some(&10));
+        assert_eq!(stats.get("size"), Some(&1024));
+        assert_eq!(stats.get("l2_hits"), Some(&5));
+    }
+
+    #[test]
+    fn derives_arc_and_l2arc_ratios() {
+        let stats = parse_arcstats(
+            "\
+name type data
+hits 4 90
+misses 4 10
+demand_data_hits 4 45
+demand_data_misses 4 5
+demand_metadata_hits 4 40
+demand_metadata_misses 4 10
+prefetch_data_hits 4 4
+prefetch_data_misses 4 6
+prefetch_metadata_hits 4 1
+prefetch_metadata_misses 4 9
+c 4 2048
+c_min 4 1024
+c_max 4 4096
+size 4 1536
+compressed_size 4 1400
+uncompressed_size 4 3000
+data_size 4 512
+metadata_size 4 256
+dbuf_size 4 64
+dnode_size 4 32
+mru_size 4 128
+mfu_size 4 256
+l2_hits 4 5
+l2_misses 4 15
+l2_size 4 8192
+l2_asize 4 4096
+l2_read_bytes 4 1000
+l2_write_bytes 4 2000
+l2_writes_sent 4 7
+l2_writes_done 4 6
+l2_writes_error 4 1
+l2_cksum_bad 4 2
+l2_io_error 4 3
+memory_all_bytes 4 100000
+memory_free_bytes 4 20000
+memory_available_bytes 4 50000
+memory_throttle_count 4 4
+memory_direct_count 4 5
+memory_indirect_count 4 6
+",
+        )
+        .unwrap();
+
+        assert_eq!(stats.hit_ratio_percent, Some(90.0));
+        assert_eq!(stats.l2_hit_ratio_percent, Some(25.0));
+        assert_eq!(stats.size_bytes, Some(1536));
+        assert_eq!(stats.compressed_size_bytes, Some(1400));
+        assert_eq!(stats.uncompressed_size_bytes, Some(3000));
+        assert_eq!(stats.dbuf_size_bytes, Some(64));
+        assert_eq!(stats.dnode_size_bytes, Some(32));
+        assert_eq!(stats.l2_size_bytes, Some(8192));
+        assert_eq!(stats.l2_asize_bytes, Some(4096));
+        assert_eq!(stats.l2_writes_sent, Some(7));
+        assert_eq!(stats.l2_writes_done, Some(6));
+        assert_eq!(stats.l2_cksum_bad, Some(2));
+        assert_eq!(stats.l2_io_error, Some(3));
+        assert_eq!(stats.memory_all_bytes, Some(100000));
+        assert_eq!(stats.memory_free_bytes, Some(20000));
+        assert_eq!(stats.memory_available_bytes, Some(50000));
+        assert_eq!(stats.memory_throttle_count, Some(4));
+        assert_eq!(stats.memory_direct_count, Some(5));
+        assert_eq!(stats.memory_indirect_count, Some(6));
     }
 }
