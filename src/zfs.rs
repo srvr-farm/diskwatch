@@ -127,7 +127,40 @@ pub struct ZfsProperty {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct ZfsVdevIo;
+pub struct ZfsVdevIo {
+    pub name: String,
+    pub allocated_bytes: Option<u64>,
+    pub free_bytes: Option<u64>,
+    pub read_ops_per_sec: Option<f64>,
+    pub write_ops_per_sec: Option<f64>,
+    pub read_bytes_per_sec: Option<f64>,
+    pub write_bytes_per_sec: Option<f64>,
+    pub total_wait_read_ns: Option<u64>,
+    pub total_wait_write_ns: Option<u64>,
+    pub disk_wait_read_ns: Option<u64>,
+    pub disk_wait_write_ns: Option<u64>,
+    pub sync_queue_wait_read_ns: Option<u64>,
+    pub sync_queue_wait_write_ns: Option<u64>,
+    pub async_queue_wait_read_ns: Option<u64>,
+    pub async_queue_wait_write_ns: Option<u64>,
+    pub scrub_wait_ns: Option<u64>,
+    pub trim_wait_ns: Option<u64>,
+    pub rebuild_wait_ns: Option<u64>,
+    pub sync_read_queue_pending: Option<u64>,
+    pub sync_read_queue_active: Option<u64>,
+    pub sync_write_queue_pending: Option<u64>,
+    pub sync_write_queue_active: Option<u64>,
+    pub async_read_queue_pending: Option<u64>,
+    pub async_read_queue_active: Option<u64>,
+    pub async_write_queue_pending: Option<u64>,
+    pub async_write_queue_active: Option<u64>,
+    pub scrub_read_queue_pending: Option<u64>,
+    pub scrub_read_queue_active: Option<u64>,
+    pub trim_write_queue_pending: Option<u64>,
+    pub trim_write_queue_active: Option<u64>,
+    pub rebuild_write_queue_pending: Option<u64>,
+    pub rebuild_write_queue_active: Option<u64>,
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ZfsPoolKstats;
@@ -467,6 +500,15 @@ fn parse_optional_u64(value: &str) -> Option<u64> {
     }
 }
 
+fn parse_optional_f64(value: &str) -> Option<f64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "-" {
+        None
+    } else {
+        trimmed.parse().ok()
+    }
+}
+
 pub fn parse_kstat_map(input: &str) -> KstatMap {
     input
         .lines()
@@ -589,6 +631,53 @@ pub fn apply_zfs_get_properties(datasets: &mut [ZfsDataset], input: &str) {
             },
         );
     }
+}
+
+pub fn parse_zpool_iostat(input: &str) -> Vec<ZfsVdevIo> {
+    input
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split('\t').map(str::trim).collect();
+            if fields.len() < 32 || fields[0].is_empty() {
+                return None;
+            }
+
+            Some(ZfsVdevIo {
+                name: fields[0].to_string(),
+                allocated_bytes: parse_optional_u64(fields[1]),
+                free_bytes: parse_optional_u64(fields[2]),
+                read_ops_per_sec: parse_optional_f64(fields[3]),
+                write_ops_per_sec: parse_optional_f64(fields[4]),
+                read_bytes_per_sec: parse_optional_f64(fields[5]),
+                write_bytes_per_sec: parse_optional_f64(fields[6]),
+                total_wait_read_ns: parse_optional_u64(fields[7]),
+                total_wait_write_ns: parse_optional_u64(fields[8]),
+                disk_wait_read_ns: parse_optional_u64(fields[9]),
+                disk_wait_write_ns: parse_optional_u64(fields[10]),
+                sync_queue_wait_read_ns: parse_optional_u64(fields[11]),
+                sync_queue_wait_write_ns: parse_optional_u64(fields[12]),
+                async_queue_wait_read_ns: parse_optional_u64(fields[13]),
+                async_queue_wait_write_ns: parse_optional_u64(fields[14]),
+                scrub_wait_ns: parse_optional_u64(fields[15]),
+                trim_wait_ns: parse_optional_u64(fields[16]),
+                rebuild_wait_ns: parse_optional_u64(fields[17]),
+                sync_read_queue_pending: parse_optional_u64(fields[18]),
+                sync_read_queue_active: parse_optional_u64(fields[19]),
+                sync_write_queue_pending: parse_optional_u64(fields[20]),
+                sync_write_queue_active: parse_optional_u64(fields[21]),
+                async_read_queue_pending: parse_optional_u64(fields[22]),
+                async_read_queue_active: parse_optional_u64(fields[23]),
+                async_write_queue_pending: parse_optional_u64(fields[24]),
+                async_write_queue_active: parse_optional_u64(fields[25]),
+                scrub_read_queue_pending: parse_optional_u64(fields[26]),
+                scrub_read_queue_active: parse_optional_u64(fields[27]),
+                trim_write_queue_pending: parse_optional_u64(fields[28]),
+                trim_write_queue_active: parse_optional_u64(fields[29]),
+                rebuild_write_queue_pending: parse_optional_u64(fields[30]),
+                rebuild_write_queue_active: parse_optional_u64(fields[31]),
+            })
+        })
+        .collect()
 }
 
 fn ratio_from_keys(stats: &KstatMap, numerator_key: &str, other_key: &str) -> Option<f64> {
@@ -858,5 +947,22 @@ data\treadonly\toff\tdefault
             datasets[0].properties.get("primarycache").unwrap().value,
             "all"
         );
+    }
+
+    #[test]
+    fn parses_zpool_iostat_latency_and_queue_fields() {
+        let input = "data\t10665755332608\t19295936524288\t0\t382\t0\t4010886\t-\t3094394\t-\t795672\t-\t-\t-\t2376632\t-\t-\t-\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\n";
+        let rows = parse_zpool_iostat(input);
+        let row = &rows[0];
+
+        assert_eq!(row.name, "data");
+        assert_eq!(row.allocated_bytes, Some(10_665_755_332_608));
+        assert_eq!(row.write_ops_per_sec, Some(382.0));
+        assert_eq!(row.write_bytes_per_sec, Some(4_010_886.0));
+        assert_eq!(row.total_wait_read_ns, None);
+        assert_eq!(row.total_wait_write_ns, Some(3_094_394));
+        assert_eq!(row.async_queue_wait_write_ns, Some(2_376_632));
+        assert_eq!(row.sync_read_queue_pending, Some(0));
+        assert_eq!(row.rebuild_write_queue_active, Some(0));
     }
 }
