@@ -105,7 +105,26 @@ pub struct ArcStats {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct ZfsDataset;
+pub struct ZfsDataset {
+    pub name: String,
+    pub used_bytes: Option<u64>,
+    pub available_bytes: Option<u64>,
+    pub referenced_bytes: Option<u64>,
+    pub mountpoint: Option<String>,
+    pub compression: Option<String>,
+    pub compressratio: Option<f64>,
+    pub used_snap_bytes: Option<u64>,
+    pub used_dataset_bytes: Option<u64>,
+    pub used_refreservation_bytes: Option<u64>,
+    pub used_child_bytes: Option<u64>,
+    pub properties: HashMap<String, ZfsProperty>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ZfsProperty {
+    pub value: String,
+    pub source: Option<String>,
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ZfsVdevIo;
@@ -519,6 +538,59 @@ pub fn parse_arcstats(input: &str) -> Option<ArcStats> {
     })
 }
 
+pub fn parse_zfs_list(input: &str) -> Vec<ZfsDataset> {
+    input
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split('\t').map(str::trim).collect();
+            if fields.len() < 11 || fields[0].is_empty() {
+                return None;
+            }
+
+            Some(ZfsDataset {
+                name: fields[0].to_string(),
+                used_bytes: parse_optional_u64(fields[1]),
+                available_bytes: parse_optional_u64(fields[2]),
+                referenced_bytes: parse_optional_u64(fields[3]),
+                mountpoint: dash_to_none(fields[4]),
+                compression: dash_to_none(fields[5]),
+                compressratio: parse_ratio(fields[6]),
+                used_snap_bytes: parse_optional_u64(fields[7]),
+                used_dataset_bytes: parse_optional_u64(fields[8]),
+                used_refreservation_bytes: parse_optional_u64(fields[9]),
+                used_child_bytes: parse_optional_u64(fields[10]),
+                properties: HashMap::new(),
+            })
+        })
+        .collect()
+}
+
+pub fn apply_zfs_get_properties(datasets: &mut [ZfsDataset], input: &str) {
+    let indexes_by_name: HashMap<_, _> = datasets
+        .iter()
+        .enumerate()
+        .map(|(index, dataset)| (dataset.name.clone(), index))
+        .collect();
+
+    for line in input.lines() {
+        let fields: Vec<_> = line.split('\t').map(str::trim).collect();
+        if fields.len() < 4 {
+            continue;
+        }
+        let Some(index) = indexes_by_name.get(fields[0]).copied() else {
+            continue;
+        };
+
+        datasets[index].properties.insert(
+            fields[1].to_string(),
+            ZfsProperty {
+                value: fields[2].to_string(),
+                source: dash_to_none(fields[3]),
+            },
+        );
+    }
+}
+
 fn ratio_from_keys(stats: &KstatMap, numerator_key: &str, other_key: &str) -> Option<f64> {
     let numerator = *stats.get(numerator_key)?;
     let other = *stats.get(other_key)?;
@@ -751,5 +823,40 @@ memory_indirect_count 4 6
         assert_eq!(stats.memory_throttle_count, Some(4));
         assert_eq!(stats.memory_direct_count, Some(5));
         assert_eq!(stats.memory_indirect_count, Some(6));
+    }
+
+    #[test]
+    fn parses_zfs_dataset_usage() {
+        let input = "data\t6311953548792\t11187890698760\t6311795099184\t/data\ton\t1.08\t0\t6311795099184\t0\t158449608\n";
+        let datasets = parse_zfs_list(input);
+        let dataset = &datasets[0];
+
+        assert_eq!(dataset.name, "data");
+        assert_eq!(dataset.used_bytes, Some(6_311_953_548_792));
+        assert_eq!(dataset.available_bytes, Some(11_187_890_698_760));
+        assert_eq!(dataset.mountpoint.as_deref(), Some("/data"));
+        assert_eq!(dataset.compression.as_deref(), Some("on"));
+        assert_eq!(dataset.compressratio, Some(1.08));
+    }
+
+    #[test]
+    fn applies_zfs_get_properties_to_datasets() {
+        let mut datasets = parse_zfs_list("data\t1\t2\t3\t/data\ton\t1.00\t0\t1\t0\t0\n");
+        let input = "\
+data\trecordsize\t131072\tdefault
+data\tprimarycache\tall\tdefault
+data\treadonly\toff\tdefault
+";
+
+        apply_zfs_get_properties(&mut datasets, input);
+
+        assert_eq!(
+            datasets[0].properties.get("recordsize").unwrap().value,
+            "131072"
+        );
+        assert_eq!(
+            datasets[0].properties.get("primarycache").unwrap().value,
+            "all"
+        );
     }
 }
