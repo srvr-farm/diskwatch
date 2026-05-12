@@ -11,6 +11,8 @@ pub struct Cli {
     pub show_loop: bool,
     #[arg(long = "tmpfs")]
     pub show_tmpfs: bool,
+    #[arg(long = "zfs-deep")]
+    pub zfs_deep: bool,
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
@@ -50,6 +52,12 @@ mod tests {
         let cli = Cli::try_parse_from(["diskwatch", "--loop", "--tmpfs"]).unwrap();
         assert!(cli.show_loop);
         assert!(cli.show_tmpfs);
+    }
+
+    #[test]
+    fn parses_zfs_deep_display_flag() {
+        let cli = Cli::try_parse_from(["diskwatch", "--zfs-deep"]).unwrap();
+        assert!(cli.zfs_deep);
     }
 
     #[test]

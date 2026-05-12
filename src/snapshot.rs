@@ -32,6 +32,7 @@ pub struct Snapshot {
 pub struct DisplayOptions {
     pub show_loop: bool,
     pub show_tmpfs: bool,
+    pub zfs_deep: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -41,6 +42,7 @@ struct OptionalCommandCache {
     lvm: LvmSnapshot,
     smart: Vec<SmartHealth>,
     diagnostics: Vec<String>,
+    zfs_deep: bool,
     device_names: Vec<String>,
     collected_at: Option<Instant>,
 }
@@ -135,6 +137,10 @@ impl Sampler {
     }
 
     pub fn sample_at(&mut self, now: Instant) -> Snapshot {
+        self.sample_at_with_optional(now, true)
+    }
+
+    pub fn sample_at_with_optional(&mut self, now: Instant, collect_optional: bool) -> Snapshot {
         let current_diskstats = read_diskstats(&self.diskstats_path);
         let mut activity = self
             .previous_at
@@ -154,7 +160,7 @@ impl Sampler {
         let filesystems =
             filter_filesystems(collect_filesystems(&self.mounts_path), self.display_options);
         let mut mdraid = read_mdstat(&self.mdstat_path);
-        let optional_commands = self.optional_commands_snapshot(&devices, now);
+        let optional_commands = self.optional_commands_snapshot(&devices, now, collect_optional);
         raid::apply_mdadm_detail_scan(&mut mdraid, &optional_commands.mdadm_scan);
 
         self.previous_diskstats = current_diskstats;
@@ -176,25 +182,35 @@ impl Sampler {
         &mut self,
         devices: &[BlockDevice],
         now: Instant,
+        collect_optional: bool,
     ) -> OptionalCommandCache {
-        if !self.optional_commands_enabled {
+        if !self.optional_commands_enabled || !collect_optional {
             return OptionalCommandCache::default();
         }
 
         let device_names = optional_device_names(devices);
-        if self.optional_cache_is_fresh(&device_names, now) {
+        if self.optional_cache_is_fresh(&device_names, self.display_options.zfs_deep, now) {
             return self.optional_cache.clone();
         }
 
         let mut cache = self.collect_optional_commands(devices);
         cache.device_names = device_names;
+        cache.zfs_deep = self.display_options.zfs_deep;
         cache.collected_at = Some(now);
         self.optional_cache = cache;
         self.optional_cache.clone()
     }
 
-    fn optional_cache_is_fresh(&self, device_names: &[String], now: Instant) -> bool {
+    fn optional_cache_is_fresh(
+        &self,
+        device_names: &[String],
+        zfs_deep: bool,
+        now: Instant,
+    ) -> bool {
         if self.optional_cache.device_names != device_names {
+            return false;
+        }
+        if self.optional_cache.zfs_deep != zfs_deep {
             return false;
         }
 
@@ -319,6 +335,7 @@ fn optional_cache(
         lvm,
         smart,
         diagnostics,
+        zfs_deep: false,
         device_names: Vec::new(),
         collected_at: None,
     }
@@ -642,6 +659,7 @@ mod tests {
         sampler.display_options = DisplayOptions {
             show_loop: true,
             show_tmpfs: true,
+            zfs_deep: false,
         };
         let started = Instant::now();
         let _ = sampler.sample_at(started);
@@ -743,6 +761,40 @@ mod tests {
             Some("ARRAY /dev/md0 metadata=1.2 UUID=abc name=host:0")
         );
         assert_eq!(snapshot.diagnostics, ["cached optional data"]);
+    }
+
+    #[test]
+    fn optional_cache_key_tracks_zfs_depth_only() {
+        let temp = TempDir::new().unwrap();
+        let diskstats = temp.path().join("diskstats");
+        let sys_block = temp.path().join("sys/block");
+        let mounts = temp.path().join("mounts");
+        let mdstat = temp.path().join("mdstat");
+        write(&diskstats, "");
+        write(&sys_block.join("sda/size"), "2097152\n");
+        write(&mounts, "");
+        write(&mdstat, "");
+
+        let mut sampler = Sampler::new_for_tests_with_paths(diskstats, sys_block, mounts, mdstat);
+        sampler.optional_commands_enabled = true;
+        sampler.optional_cache.zfs_deep = false;
+        sampler.optional_cache.device_names = vec!["sda".to_string()];
+        sampler.optional_cache.collected_at = Some(Instant::now());
+
+        assert!(sampler.optional_cache_is_fresh(&["sda".to_string()], false, Instant::now()));
+        assert!(!sampler.optional_cache_is_fresh(&["sda".to_string()], true, Instant::now()));
+    }
+
+    #[test]
+    fn warmup_sample_can_skip_optional_commands() {
+        let diskstats = NamedTempFile::new().unwrap();
+        let mut sampler = Sampler::new_for_tests(diskstats.path().to_path_buf());
+        sampler.optional_commands_enabled = true;
+
+        let snapshot = sampler.sample_at_with_optional(Instant::now(), false);
+
+        assert!(snapshot.zfs.is_empty());
+        assert!(snapshot.diagnostics.is_empty());
     }
 
     fn assert_close(actual: f64, expected: f64) {

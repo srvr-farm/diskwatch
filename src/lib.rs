@@ -33,6 +33,7 @@ pub fn run_with_cli(cli: Cli) -> anyhow::Result<()> {
     let display_options = DisplayOptions {
         show_loop: cli.show_loop,
         show_tmpfs: cli.show_tmpfs,
+        zfs_deep: cli.zfs_deep,
     };
     if cli.once {
         run_once(cli.interval, display_options)
@@ -43,9 +44,9 @@ pub fn run_with_cli(cli: Cli) -> anyhow::Result<()> {
 
 fn run_once(interval: Duration, display_options: DisplayOptions) -> anyhow::Result<()> {
     let mut sampler = Sampler::default().with_display_options(display_options);
-    let _ = sampler.sample();
+    let _ = sampler.sample_at_with_optional(Instant::now(), false);
     thread::sleep(interval);
-    let snapshot = sampler.sample();
+    let snapshot = sampler.sample_at_with_optional(Instant::now(), true);
     write_once_report(&mut io::stdout(), &snapshot).context("write one-shot report")?;
     Ok(())
 }
