@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_millis(750);
 const OPTIONAL_COMMAND_TOTAL_BUDGET: Duration = Duration::from_millis(750);
+const DEEP_ZFS_TOTAL_BUDGET: Duration = Duration::from_millis(2500);
+const DEEP_ZFS_COMMAND_TIMEOUT: Duration = Duration::from_millis(1500);
 const OPTIONAL_COMMAND_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const OPTIONAL_COMMAND_BUDGET_EXHAUSTED_DIAGNOSTIC: &str =
     "optional command budget exhausted; remaining optional data deferred";
@@ -223,12 +225,23 @@ impl Sampler {
     }
 
     fn collect_optional_commands(&self, devices: &[BlockDevice]) -> OptionalCommandCache {
-        let budget =
-            OptionalCommandBudget::new(OPTIONAL_COMMAND_TOTAL_BUDGET, DEFAULT_COMMAND_TIMEOUT);
         let mut diagnostics = Vec::new();
 
-        let (zfs, zfs_diagnostics) = zfs::collect_budgeted(&budget);
+        let zfs_mode = if self.display_options.zfs_deep {
+            zfs::ZfsCollectionMode::Deep
+        } else {
+            zfs::ZfsCollectionMode::Shallow
+        };
+        let zfs_budget = if self.display_options.zfs_deep {
+            OptionalCommandBudget::new(DEEP_ZFS_TOTAL_BUDGET, DEEP_ZFS_COMMAND_TIMEOUT)
+        } else {
+            OptionalCommandBudget::new(OPTIONAL_COMMAND_TOTAL_BUDGET, DEFAULT_COMMAND_TIMEOUT)
+        };
+        let (zfs, zfs_diagnostics) = zfs::collect_budgeted(&zfs_budget, zfs_mode);
         diagnostics.extend(zfs_diagnostics);
+
+        let budget =
+            OptionalCommandBudget::new(OPTIONAL_COMMAND_TOTAL_BUDGET, DEFAULT_COMMAND_TIMEOUT);
         if append_budget_exhausted_if_needed(&budget, &mut diagnostics) {
             return optional_cache(
                 zfs,

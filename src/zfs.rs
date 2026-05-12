@@ -1,8 +1,22 @@
 use crate::commands;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 use std::time::Duration;
 
 pub type KstatMap = HashMap<String, u64>;
+
+const DEFAULT_KSTAT_ROOT: &str = "/proc/spl/kstat/zfs";
+const KSTAT_FILE_LIMIT: usize = 256 * 1024;
+const TXGS_FILE_LIMIT: usize = 512 * 1024;
+const IOSTAT_MINIMUM_BUDGET: Duration = Duration::from_millis(1100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZfsCollectionMode {
+    Shallow,
+    Deep,
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ZfsSnapshot {
@@ -166,7 +180,65 @@ pub struct ZfsVdevIo {
 pub struct ZfsPoolKstats;
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct ZfsKernelStats;
+pub struct ZfsKernelStats {
+    pub dbuf: Option<DbufStats>,
+    pub dnode: Option<DnodeStats>,
+    pub zil: Option<ZilStats>,
+    pub zfetch: Option<ZfetchStats>,
+    pub abd: Option<AbdStats>,
+    pub txg: Option<TxgSummary>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DbufStats {
+    pub cache_size_bytes: Option<u64>,
+    pub cache_target_bytes: Option<u64>,
+    pub hash_hits: Option<u64>,
+    pub hash_misses: Option<u64>,
+    pub cache_total_evicts: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DnodeStats {
+    pub hold_alloc_hits: Option<u64>,
+    pub hold_alloc_misses: Option<u64>,
+    pub allocate: Option<u64>,
+    pub buf_evict: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ZilStats {
+    pub commit_count: Option<u64>,
+    pub itx_count: Option<u64>,
+    pub itx_metaslab_normal_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ZfetchStats {
+    pub hits: Option<u64>,
+    pub misses: Option<u64>,
+    pub io_issued: Option<u64>,
+    pub io_active: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AbdStats {
+    pub linear_count: Option<u64>,
+    pub linear_data_size_bytes: Option<u64>,
+    pub scatter_count: Option<u64>,
+    pub scatter_data_size_bytes: Option<u64>,
+    pub scatter_page_alloc_retry: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TxgSummary {
+    pub latest_txg: Option<u64>,
+    pub latest_dirty_bytes: Option<u64>,
+    pub latest_read_bytes: Option<u64>,
+    pub latest_written_bytes: Option<u64>,
+    pub latest_reads: Option<u64>,
+    pub latest_writes: Option<u64>,
+}
 
 pub fn parse_zpool_list(input: &str) -> Vec<ZfsPool> {
     input
@@ -304,33 +376,80 @@ pub fn parse_zpool_status(input: &str) -> Vec<ZpoolStatus> {
 }
 
 pub fn collect(timeout: Duration) -> (ZfsSnapshot, Vec<String>) {
-    collect_with_availability(timeout, commands::program_available("zpool"))
+    collect_with_availability(
+        timeout,
+        commands::program_available("zpool"),
+        ZfsCollectionMode::Shallow,
+    )
 }
 
-pub fn collect_budgeted(budget: &commands::OptionalCommandBudget) -> (ZfsSnapshot, Vec<String>) {
+pub fn collect_budgeted(
+    budget: &commands::OptionalCommandBudget,
+    mode: ZfsCollectionMode,
+) -> (ZfsSnapshot, Vec<String>) {
     if !commands::program_available("zpool") {
         return (ZfsSnapshot::default(), vec!["zpool not found".to_string()]);
     }
 
-    collect_with_runner(|program, args| commands::run_optional_budgeted(program, args, budget))
+    collect_with_runner_budget_and_roots(
+        mode,
+        budget,
+        Path::new(DEFAULT_KSTAT_ROOT),
+        |program, args| commands::run_optional_budgeted(program, args, budget),
+    )
 }
 
 fn collect_with_availability(
     timeout: Duration,
     zpool_available: bool,
+    mode: ZfsCollectionMode,
 ) -> (ZfsSnapshot, Vec<String>) {
     if !zpool_available {
         return (ZfsSnapshot::default(), vec!["zpool not found".to_string()]);
     }
 
-    collect_with_runner(|program, args| Some(commands::run_optional(program, args, timeout)))
+    let budget = commands::OptionalCommandBudget::new(timeout, timeout);
+    collect_with_runner_budget_and_roots(
+        mode,
+        &budget,
+        Path::new(DEFAULT_KSTAT_ROOT),
+        |program, args| Some(commands::run_optional(program, args, timeout)),
+    )
 }
 
-fn collect_with_runner<F>(mut run: F) -> (ZfsSnapshot, Vec<String>)
+#[cfg(test)]
+fn collect_with_runner_and_roots<F, P>(
+    mode: ZfsCollectionMode,
+    kstat_root: P,
+    run: F,
+) -> (ZfsSnapshot, Vec<String>)
 where
     F: FnMut(&str, &[&str]) -> Option<commands::OptionalCommandOutput>,
+    P: AsRef<Path>,
+{
+    let budget = commands::OptionalCommandBudget::new(
+        Duration::from_millis(2500),
+        Duration::from_millis(1500),
+    );
+    collect_with_runner_budget_and_roots(mode, &budget, kstat_root, run)
+}
+
+fn collect_with_runner_budget_and_roots<F, P>(
+    mode: ZfsCollectionMode,
+    budget: &commands::OptionalCommandBudget,
+    kstat_root: P,
+    mut run: F,
+) -> (ZfsSnapshot, Vec<String>)
+where
+    F: FnMut(&str, &[&str]) -> Option<commands::OptionalCommandOutput>,
+    P: AsRef<Path>,
 {
     let mut diagnostics = Vec::new();
+    let mut snapshot = ZfsSnapshot {
+        deep: mode == ZfsCollectionMode::Deep,
+        ..ZfsSnapshot::default()
+    };
+
     let Some(list_result) = run(
         "zpool",
         &[
@@ -340,10 +459,10 @@ where
             "name,size,allocated,free,capacity,dedupratio,fragmentation,health,altroot,autotrim",
         ],
     ) else {
-        return (ZfsSnapshot::default(), diagnostics);
+        return (snapshot, diagnostics);
     };
 
-    let mut pools = list_result
+    snapshot.pools = list_result
         .output
         .as_deref()
         .map(parse_zpool_list)
@@ -353,13 +472,8 @@ where
     }
 
     let Some(status_result) = run("zpool", &["status", "-P"]) else {
-        return (
-            ZfsSnapshot {
-                pools,
-                ..ZfsSnapshot::default()
-            },
-            diagnostics,
-        );
+        collect_arcstats(kstat_root.as_ref(), &mut snapshot, &mut diagnostics);
+        return (snapshot, diagnostics);
     };
 
     let statuses = status_result
@@ -371,12 +485,30 @@ where
         diagnostics.push(diagnostic);
     }
 
+    apply_statuses_to_pools(&mut snapshot.pools, statuses);
+    collect_arcstats(kstat_root.as_ref(), &mut snapshot, &mut diagnostics);
+
+    if mode == ZfsCollectionMode::Shallow {
+        return (snapshot, diagnostics);
+    }
+
+    let (kernel, kernel_diagnostics) = collect_kstats(kstat_root.as_ref(), &snapshot.pools);
+    snapshot.kernel = kernel;
+    diagnostics.extend(kernel_diagnostics);
+
+    collect_deep_datasets(&mut snapshot, &mut diagnostics, budget, &mut run);
+    collect_deep_iostat(&mut snapshot, &mut diagnostics, budget, &mut run);
+
+    (snapshot, diagnostics)
+}
+
+fn apply_statuses_to_pools(pools: &mut [ZfsPool], statuses: Vec<ZpoolStatus>) {
     let statuses_by_name: HashMap<_, _> = statuses
         .into_iter()
         .map(|status| (status.name.clone(), status))
         .collect();
 
-    for pool in &mut pools {
+    for pool in pools {
         if let Some(status) = statuses_by_name.get(&pool.name) {
             pool.status = status.status.clone();
             pool.action = status.action.clone();
@@ -385,14 +517,251 @@ where
             pool.topology = status.topology.clone();
         }
     }
+}
 
-    (
-        ZfsSnapshot {
-            pools,
-            ..ZfsSnapshot::default()
-        },
-        diagnostics,
+fn collect_arcstats(kstat_root: &Path, snapshot: &mut ZfsSnapshot, diagnostics: &mut Vec<String>) {
+    if let Some(input) = read_optional_kstat(kstat_root, "arcstats", KSTAT_FILE_LIMIT, diagnostics)
+    {
+        snapshot.arc = parse_arcstats(&input);
+    }
+}
+
+fn collect_deep_datasets<F>(
+    snapshot: &mut ZfsSnapshot,
+    diagnostics: &mut Vec<String>,
+    budget: &commands::OptionalCommandBudget,
+    run: &mut F,
+) where
+    F: FnMut(&str, &[&str]) -> Option<commands::OptionalCommandOutput>,
+{
+    if snapshot.pools.is_empty() {
+        return;
+    }
+    if budget.remaining_timeout().is_none() {
+        diagnostics.push("zfs list skipped: deep ZFS budget exhausted".to_string());
+        return;
+    }
+
+    let pool_names: Vec<_> = snapshot
+        .pools
+        .iter()
+        .map(|pool| pool.name.clone())
+        .collect();
+    let list_args = zfs_list_args(&pool_names);
+    let Some(list_result) = run_with_owned_args(run, "zfs", &list_args) else {
+        diagnostics.push("zfs list skipped: deep ZFS budget exhausted".to_string());
+        return;
+    };
+    if let Some(diagnostic) = list_result.diagnostic {
+        diagnostics.push(diagnostic);
+    }
+    snapshot.datasets = list_result
+        .output
+        .as_deref()
+        .map(parse_zfs_list)
+        .unwrap_or_default();
+
+    if budget.remaining_timeout().is_none() {
+        diagnostics.push("zfs get skipped: deep ZFS budget exhausted".to_string());
+        return;
+    }
+
+    let get_args = zfs_get_args(&pool_names);
+    let Some(get_result) = run_with_owned_args(run, "zfs", &get_args) else {
+        diagnostics.push("zfs get skipped: deep ZFS budget exhausted".to_string());
+        return;
+    };
+    if let Some(diagnostic) = get_result.diagnostic {
+        diagnostics.push(diagnostic);
+    }
+    if let Some(output) = get_result.output.as_deref() {
+        apply_zfs_get_properties(&mut snapshot.datasets, output);
+    }
+}
+
+fn collect_deep_iostat<F>(
+    snapshot: &mut ZfsSnapshot,
+    diagnostics: &mut Vec<String>,
+    budget: &commands::OptionalCommandBudget,
+    run: &mut F,
+) where
+    F: FnMut(&str, &[&str]) -> Option<commands::OptionalCommandOutput>,
+{
+    if snapshot.pools.is_empty() {
+        return;
+    }
+    if !budget_has_iostat_time(budget) {
+        diagnostics.push("zpool iostat skipped: deep ZFS budget exhausted".to_string());
+        return;
+    }
+
+    let pool_names: Vec<_> = snapshot
+        .pools
+        .iter()
+        .map(|pool| pool.name.clone())
+        .collect();
+    let args = zpool_iostat_args(&pool_names);
+    let Some(result) = run_with_owned_args(run, "zpool", &args) else {
+        diagnostics.push("zpool iostat skipped: deep ZFS budget exhausted".to_string());
+        return;
+    };
+    if let Some(diagnostic) = result.diagnostic {
+        diagnostics.push(normalize_iostat_diagnostic(&diagnostic));
+    }
+    if let Some(output) = result.output.as_deref() {
+        attach_iostat_rows(&mut snapshot.pools, parse_zpool_iostat(output));
+    }
+}
+
+fn zfs_list_args(pool_names: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "list".to_string(),
+        "-Hp".to_string(),
+        "-r".to_string(),
+        "-t".to_string(),
+        "filesystem,volume".to_string(),
+        "-o".to_string(),
+        "name,used,available,referenced,mountpoint,compression,compressratio,usedsnap,usedds,usedrefreserv,usedchild".to_string(),
+    ];
+    args.extend(pool_names.iter().cloned());
+    args
+}
+
+fn zfs_get_args(pool_names: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "get".to_string(),
+        "-Hp".to_string(),
+        "-r".to_string(),
+        "-t".to_string(),
+        "filesystem,volume".to_string(),
+        "-o".to_string(),
+        "name,property,value,source".to_string(),
+        "recordsize,primarycache,secondarycache,sync,logbias,atime,dedup,checksum,encryption,readonly"
+            .to_string(),
+    ];
+    args.extend(pool_names.iter().cloned());
+    args
+}
+
+fn zpool_iostat_args(pool_names: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "iostat".to_string(),
+        "-Hp".to_string(),
+        "-vlq".to_string(),
+        "-y".to_string(),
+    ];
+    args.extend(pool_names.iter().cloned());
+    args.push("1".to_string());
+    args.push("1".to_string());
+    args
+}
+
+fn run_with_owned_args<F>(
+    run: &mut F,
+    program: &str,
+    args: &[String],
+) -> Option<commands::OptionalCommandOutput>
+where
+    F: FnMut(&str, &[&str]) -> Option<commands::OptionalCommandOutput>,
+{
+    let arg_refs: Vec<_> = args.iter().map(String::as_str).collect();
+    run(program, &arg_refs)
+}
+
+fn budget_has_iostat_time(budget: &commands::OptionalCommandBudget) -> bool {
+    budget
+        .remaining_timeout()
+        .is_some_and(|remaining| remaining >= IOSTAT_MINIMUM_BUDGET)
+}
+
+fn normalize_iostat_diagnostic(diagnostic: &str) -> String {
+    if let Some(rest) = diagnostic.strip_prefix("zpool timed out") {
+        format!("zpool iostat timed out{rest}")
+    } else if diagnostic.contains("timed out") && !diagnostic.starts_with("zpool iostat") {
+        format!("zpool iostat {diagnostic}")
+    } else {
+        diagnostic.to_string()
+    }
+}
+
+fn attach_iostat_rows(pools: &mut [ZfsPool], rows: Vec<ZfsVdevIo>) {
+    let pool_names: Vec<_> = pools.iter().map(|pool| pool.name.clone()).collect();
+    let mut current_pool: Option<String> = None;
+
+    for row in rows {
+        if pool_names.iter().any(|name| name == &row.name) {
+            current_pool = Some(row.name.clone());
+        }
+        let Some(pool_name) = current_pool.as_deref() else {
+            continue;
+        };
+        if let Some(pool) = pools.iter_mut().find(|pool| pool.name == pool_name) {
+            pool.vdev_io.push(row);
+        }
+    }
+}
+
+fn collect_kstats(kstat_root: &Path, pools: &[ZfsPool]) -> (ZfsKernelStats, Vec<String>) {
+    let mut diagnostics = Vec::new();
+    let mut kernel = ZfsKernelStats::default();
+
+    kernel.dbuf = read_optional_kstat(kstat_root, "dbufstats", KSTAT_FILE_LIMIT, &mut diagnostics)
+        .and_then(|input| parse_dbufstats(&input));
+    kernel.dnode =
+        read_optional_kstat(kstat_root, "dnodestats", KSTAT_FILE_LIMIT, &mut diagnostics)
+            .and_then(|input| parse_dnodestats(&input));
+    kernel.zil = read_optional_kstat(kstat_root, "zil", KSTAT_FILE_LIMIT, &mut diagnostics)
+        .and_then(|input| parse_zil(&input));
+    kernel.zfetch = read_optional_kstat(
+        kstat_root,
+        "zfetchstats",
+        KSTAT_FILE_LIMIT,
+        &mut diagnostics,
     )
+    .and_then(|input| parse_zfetchstats(&input));
+    kernel.abd = read_optional_kstat(kstat_root, "abdstats", KSTAT_FILE_LIMIT, &mut diagnostics)
+        .and_then(|input| parse_abdstats(&input));
+
+    for pool in pools {
+        let relative = format!("{}/txgs", pool.name);
+        if let Some(input) =
+            read_optional_kstat(kstat_root, &relative, TXGS_FILE_LIMIT, &mut diagnostics)
+        {
+            kernel.txg = parse_txgs(&input);
+            break;
+        }
+    }
+
+    (kernel, diagnostics)
+}
+
+fn read_optional_kstat(
+    root: &Path,
+    relative: &str,
+    max_bytes: usize,
+    diagnostics: &mut Vec<String>,
+) -> Option<String> {
+    let path = root.join(relative);
+    if !path.exists() {
+        return None;
+    }
+
+    match read_kstat_file(&path, max_bytes) {
+        Ok(contents) => Some(contents),
+        Err(error) => {
+            diagnostics.push(format!("zfs kstat {relative} unreadable: {error}"));
+            None
+        }
+    }
+}
+
+fn read_kstat_file(path: &Path, max_bytes: usize) -> Result<String, String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let mut contents = String::new();
+    file.take(max_bytes as u64)
+        .read_to_string(&mut contents)
+        .map_err(|error| error.to_string())?;
+    Ok(contents)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -680,6 +1049,78 @@ pub fn parse_zpool_iostat(input: &str) -> Vec<ZfsVdevIo> {
         .collect()
 }
 
+pub fn parse_dbufstats(input: &str) -> Option<DbufStats> {
+    let raw = parse_kstat_map(input);
+    Some(DbufStats {
+        cache_size_bytes: raw.get("cache_size_bytes").copied(),
+        cache_target_bytes: raw.get("cache_target_bytes").copied(),
+        hash_hits: raw.get("hash_hits").copied(),
+        hash_misses: raw.get("hash_misses").copied(),
+        cache_total_evicts: raw.get("cache_total_evicts").copied(),
+    })
+}
+
+pub fn parse_dnodestats(input: &str) -> Option<DnodeStats> {
+    let raw = parse_kstat_map(input);
+    Some(DnodeStats {
+        hold_alloc_hits: raw.get("dnode_hold_alloc_hits").copied(),
+        hold_alloc_misses: raw.get("dnode_hold_alloc_misses").copied(),
+        allocate: raw.get("dnode_allocate").copied(),
+        buf_evict: raw.get("dnode_buf_evict").copied(),
+    })
+}
+
+pub fn parse_zil(input: &str) -> Option<ZilStats> {
+    let raw = parse_kstat_map(input);
+    Some(ZilStats {
+        commit_count: raw.get("zil_commit_count").copied(),
+        itx_count: raw.get("zil_itx_count").copied(),
+        itx_metaslab_normal_bytes: raw.get("zil_itx_metaslab_normal_bytes").copied(),
+    })
+}
+
+pub fn parse_zfetchstats(input: &str) -> Option<ZfetchStats> {
+    let raw = parse_kstat_map(input);
+    Some(ZfetchStats {
+        hits: raw.get("hits").copied(),
+        misses: raw.get("misses").copied(),
+        io_issued: raw.get("io_issued").copied(),
+        io_active: raw.get("io_active").copied(),
+    })
+}
+
+pub fn parse_abdstats(input: &str) -> Option<AbdStats> {
+    let raw = parse_kstat_map(input);
+    Some(AbdStats {
+        linear_count: raw.get("linear_cnt").copied(),
+        linear_data_size_bytes: raw.get("linear_data_size").copied(),
+        scatter_count: raw.get("scatter_cnt").copied(),
+        scatter_data_size_bytes: raw.get("scatter_data_size").copied(),
+        scatter_page_alloc_retry: raw.get("scatter_page_alloc_retry").copied(),
+    })
+}
+
+pub fn parse_txgs(input: &str) -> Option<TxgSummary> {
+    let fields: Vec<_> = input
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| !line.trim_start().starts_with("txg "))
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            (fields.len() >= 8).then_some(fields)
+        })
+        .last()?;
+
+    Some(TxgSummary {
+        latest_txg: parse_optional_u64(fields[0]),
+        latest_dirty_bytes: parse_optional_u64(fields[3]),
+        latest_read_bytes: parse_optional_u64(fields[4]),
+        latest_written_bytes: parse_optional_u64(fields[5]),
+        latest_reads: parse_optional_u64(fields[6]),
+        latest_writes: parse_optional_u64(fields[7]),
+    })
+}
+
 fn ratio_from_keys(stats: &KstatMap, numerator_key: &str, other_key: &str) -> Option<f64> {
     let numerator = *stats.get(numerator_key)?;
     let other = *stats.get(other_key)?;
@@ -731,6 +1172,8 @@ fn is_top_level_zpool_field(trimmed: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn parses_zpool_list() {
@@ -821,7 +1264,8 @@ errors: No known data errors
 
     #[test]
     fn missing_zpool_reports_one_diagnostic() {
-        let (snapshot, diagnostics) = collect_with_availability(Duration::from_secs(1), false);
+        let (snapshot, diagnostics) =
+            collect_with_availability(Duration::from_secs(1), false, ZfsCollectionMode::Shallow);
 
         assert!(snapshot.pools.is_empty());
         assert_eq!(diagnostics, ["zpool not found"]);
@@ -964,5 +1408,208 @@ data\treadonly\toff\tdefault
         assert_eq!(row.async_queue_wait_write_ns, Some(2_376_632));
         assert_eq!(row.sync_read_queue_pending, Some(0));
         assert_eq!(row.rebuild_write_queue_active, Some(0));
+    }
+
+    #[test]
+    fn deep_collector_runs_scoped_dataset_and_single_iostat_commands() {
+        let kstats = fake_kstat_root();
+        let mut calls = Vec::new();
+        let (snapshot, diagnostics) = collect_with_runner_and_roots(
+            ZfsCollectionMode::Deep,
+            kstats.path(),
+            |program, args| {
+                calls.push(format!("{program} {}", args.join(" ")));
+                fake_success_for(program, args)
+            },
+        );
+
+        assert!(snapshot.pools.iter().any(|pool| pool.name == "data"));
+        assert!(calls.iter().any(|call| call == "zpool list -Hp -o name,size,allocated,free,capacity,dedupratio,fragmentation,health,altroot,autotrim"));
+        assert!(calls.iter().any(|call| call == "zpool status -P"));
+        assert!(calls.iter().any(|call| call == "zfs list -Hp -r -t filesystem,volume -o name,used,available,referenced,mountpoint,compression,compressratio,usedsnap,usedds,usedrefreserv,usedchild data"));
+        assert!(calls.iter().any(|call| call == "zfs get -Hp -r -t filesystem,volume -o name,property,value,source recordsize,primarycache,secondarycache,sync,logbias,atime,dedup,checksum,encryption,readonly data"));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "zpool iostat -Hp -vlq -y data 1 1")
+                .count(),
+            1
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn deep_collector_skips_zfs_list_when_budget_exhausted_after_pools() {
+        let kstats = fake_kstat_root();
+        let mut calls = Vec::new();
+        let budget = commands::OptionalCommandBudget::new(
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+        );
+        let (_snapshot, diagnostics) = collect_with_runner_budget_and_roots(
+            ZfsCollectionMode::Deep,
+            &budget,
+            kstats.path(),
+            |program, args| {
+                calls.push(format!("{program} {}", args.join(" ")));
+                if program == "zpool" && args == ["status", "-P"] {
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+                fake_success_for(program, args)
+            },
+        );
+
+        assert!(!calls.iter().any(|call| call.starts_with("zfs list ")));
+        assert!(diagnostics
+            .iter()
+            .any(|d| d == "zfs list skipped: deep ZFS budget exhausted"));
+    }
+
+    #[test]
+    fn deep_collector_skips_zfs_get_when_budget_exhausted_after_dataset_list() {
+        let kstats = fake_kstat_root();
+        let mut calls = Vec::new();
+        let budget = commands::OptionalCommandBudget::new(
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        );
+        let (_snapshot, diagnostics) = collect_with_runner_budget_and_roots(
+            ZfsCollectionMode::Deep,
+            &budget,
+            kstats.path(),
+            |program, args| {
+                calls.push(format!("{program} {}", args.join(" ")));
+                if program == "zfs" && args.first() == Some(&"list") {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                fake_success_for(program, args)
+            },
+        );
+
+        assert!(calls.iter().any(|call| call.starts_with("zfs list ")));
+        assert!(!calls.iter().any(|call| call.starts_with("zfs get ")));
+        assert!(diagnostics
+            .iter()
+            .any(|d| d == "zfs get skipped: deep ZFS budget exhausted"));
+    }
+
+    #[test]
+    fn deep_collector_rewrites_iostat_timeout_diagnostic() {
+        let kstats = fake_kstat_root();
+        let mut calls = Vec::new();
+        let budget = commands::OptionalCommandBudget::new(
+            Duration::from_millis(2500),
+            Duration::from_millis(1500),
+        );
+        let (_snapshot, diagnostics) = collect_with_runner_budget_and_roots(
+            ZfsCollectionMode::Deep,
+            &budget,
+            kstats.path(),
+            |program, args| {
+                calls.push(format!("{program} {}", args.join(" ")));
+                if program == "zpool" && args.first() == Some(&"iostat") {
+                    return Some(commands::OptionalCommandOutput {
+                        output: None,
+                        diagnostic: Some("zpool timed out after 1.5s".to_string()),
+                    });
+                }
+                fake_success_for(program, args)
+            },
+        );
+
+        assert!(calls.iter().any(|call| call.starts_with("zpool iostat ")));
+        assert!(diagnostics
+            .iter()
+            .any(|d| d.starts_with("zpool iostat timed out")));
+    }
+
+    #[test]
+    fn deep_collector_skips_iostat_when_budget_cannot_cover_interval() {
+        let kstats = fake_kstat_root();
+        let mut calls = Vec::new();
+        let budget = commands::OptionalCommandBudget::new(
+            Duration::from_millis(900),
+            Duration::from_millis(900),
+        );
+        let (_snapshot, diagnostics) = collect_with_runner_budget_and_roots(
+            ZfsCollectionMode::Deep,
+            &budget,
+            kstats.path(),
+            |program, args| {
+                calls.push(format!("{program} {}", args.join(" ")));
+                fake_success_for(program, args)
+            },
+        );
+
+        assert!(!calls.iter().any(|call| call.starts_with("zpool iostat ")));
+        assert!(diagnostics
+            .iter()
+            .any(|d| d == "zpool iostat skipped: deep ZFS budget exhausted"));
+    }
+
+    #[test]
+    fn parses_kernel_summary_kstats() {
+        let dbuf = parse_dbufstats("name type data\ncache_size_bytes 4 278614528\ncache_target_bytes 4 310263808\nhash_hits 4 46158602\nhash_misses 4 4997783\ncache_total_evicts 4 235006\n").unwrap();
+        let dnode = parse_dnodestats("name type data\ndnode_hold_alloc_hits 4 17992928\ndnode_hold_alloc_misses 4 6\ndnode_allocate 4 222738\ndnode_buf_evict 4 37777\n").unwrap();
+        let zil = parse_zil("name type data\nzil_commit_count 4 679737\nzil_itx_count 4 2252838\nzil_itx_metaslab_normal_bytes 4 7734040792\n").unwrap();
+        let zfetch = parse_zfetchstats(
+            "name type data\nhits 4 130809\nmisses 4 2512441\nio_issued 4 16434\nio_active 4 0\n",
+        )
+        .unwrap();
+        let abd = parse_abdstats("name type data\nlinear_cnt 4 95678\nlinear_data_size 4 90073088\nscatter_cnt 4 784605\nscatter_data_size 4 8236362240\nscatter_page_alloc_retry 4 0\n").unwrap();
+
+        assert_eq!(dbuf.cache_size_bytes, Some(278_614_528));
+        assert_eq!(dbuf.hash_hits, Some(46_158_602));
+        assert_eq!(dnode.allocate, Some(222_738));
+        assert_eq!(dnode.buf_evict, Some(37_777));
+        assert_eq!(zil.commit_count, Some(679_737));
+        assert_eq!(zfetch.io_issued, Some(16_434));
+        assert_eq!(abd.scatter_data_size_bytes, Some(8_236_362_240));
+    }
+
+    #[test]
+    fn parses_recent_txg_summary() {
+        let input = "\
+txg      birth            state ndirty       nread        nwritten     reads    writes   otime        qtime        wtime        stime
+7628332  165111799183944  C     1797632      0            3854336      0        385      5119403164   3133         38560        312162505
+";
+        let summary = parse_txgs(input).unwrap();
+
+        assert_eq!(summary.latest_txg, Some(7_628_332));
+        assert_eq!(summary.latest_dirty_bytes, Some(1_797_632));
+        assert_eq!(summary.latest_written_bytes, Some(3_854_336));
+    }
+
+    fn fake_kstat_root() -> TempDir {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join("data")).unwrap();
+        temp
+    }
+
+    fn fake_success_for(program: &str, args: &[&str]) -> Option<commands::OptionalCommandOutput> {
+        let output = match (program, args.first().copied()) {
+            ("zpool", Some("list")) => "data\t29961691856896\t10665749323776\t19295942533120\t35\t1.00\t1\tONLINE\t-\toff\n",
+            ("zpool", Some("status")) => "\
+  pool: data
+ state: ONLINE
+  scan: resilvered 97.1M in 00:23:33 with 0 errors on Sun May 10 17:56:02 2026
+config:
+
+\tNAME        STATE     READ WRITE CKSUM
+\tdata        ONLINE       0     0     0
+\t  raidz2-0  ONLINE       0     0     0
+\t    /dev/sdb ONLINE      0     0     0
+
+errors: No known data errors
+",
+            ("zfs", Some("list")) => "data\t6311953548792\t11187890698760\t6311795099184\t/data\ton\t1.08\t0\t6311795099184\t0\t158449608\n",
+            ("zfs", Some("get")) => "data\trecordsize\t131072\tdefault\ndata\tprimarycache\tall\tdefault\n",
+            ("zpool", Some("iostat")) => "data\t10665755332608\t19295936524288\t0\t382\t0\t4010886\t-\t3094394\t-\t795672\t-\t-\t-\t2376632\t-\t-\t-\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\n",
+            _ => return None,
+        };
+        Some(commands::OptionalCommandOutput {
+            output: Some(output.to_string()),
+            diagnostic: None,
+        })
     }
 }
