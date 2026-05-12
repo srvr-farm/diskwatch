@@ -305,6 +305,14 @@ fn storage_name_priority(name: &str) -> u8 {
 }
 
 fn write_zfs_lines(output: &mut String, snapshot: &Snapshot, indent: &str) {
+    if snapshot.zfs.deep {
+        write_zfs_deep_lines(output, snapshot, indent);
+    } else {
+        write_zfs_compact_lines(output, snapshot, indent);
+    }
+}
+
+fn write_zfs_compact_lines(output: &mut String, snapshot: &Snapshot, indent: &str) {
     if snapshot.zfs.pools.is_empty() && snapshot.zfs.arc.is_none() {
         writeln!(output, "{indent}N/A").unwrap();
         return;
@@ -370,8 +378,280 @@ fn write_zfs_lines(output: &mut String, snapshot: &Snapshot, indent: &str) {
     }
 }
 
+fn write_zfs_deep_lines(output: &mut String, snapshot: &Snapshot, indent: &str) {
+    writeln!(output, "{indent}pools:").unwrap();
+    if snapshot.zfs.pools.is_empty() {
+        writeln!(output, "{indent}  N/A").unwrap();
+    } else {
+        for pool in &snapshot.zfs.pools {
+            write_zfs_pool_lines(output, pool, indent);
+        }
+    }
+
+    write_zfs_arc_lines(output, snapshot.zfs.arc.as_ref(), indent);
+    write_zfs_dataset_lines(output, &snapshot.zfs.datasets, indent);
+    write_zfs_kernel_lines(output, &snapshot.zfs.kernel, indent);
+}
+
+fn write_zfs_pool_lines(output: &mut String, pool: &crate::zfs::ZfsPool, indent: &str) {
+    writeln!(output, "{indent}  {}", pool.name).unwrap();
+    write_zfs_nested_field(output, indent, "health:", &pool.health);
+    write_zfs_nested_field(
+        output,
+        indent,
+        "size:",
+        &format_optional_bytes(pool.size_bytes),
+    );
+    write_zfs_nested_field(
+        output,
+        indent,
+        "allocated:",
+        &format_optional_bytes(pool.allocated_bytes),
+    );
+    write_zfs_nested_field(
+        output,
+        indent,
+        "free:",
+        &format_optional_bytes(pool.free_bytes),
+    );
+    write_zfs_nested_field(
+        output,
+        indent,
+        "capacity:",
+        &format_percent(pool.capacity_percent),
+    );
+    write_zfs_nested_field(
+        output,
+        indent,
+        "fragmentation:",
+        &format_percent(pool.fragmentation_percent),
+    );
+    write_zfs_nested_field(output, indent, "dedup:", &format_ratio(pool.dedup_ratio));
+    if let Some(status) = pool.status.as_deref() {
+        write_zfs_nested_field(output, indent, "status:", status);
+    }
+    if let Some(action) = pool.action.as_deref() {
+        write_zfs_nested_field(output, indent, "action:", action);
+    }
+    if let Some(scan) = pool.scan.as_deref() {
+        write_zfs_nested_field(output, indent, "scan:", scan);
+    }
+    if let Some(errors) = pool.errors.as_deref() {
+        write_zfs_nested_field(output, indent, "errors:", errors);
+    }
+
+    if !pool.topology.is_empty() {
+        writeln!(output, "{indent}    topology:").unwrap();
+        for node in &pool.topology {
+            writeln!(
+                output,
+                "{indent}      {}{} state={} read={} write={} cksum={}",
+                "  ".repeat(node.depth),
+                node.name,
+                format_optional(node.state.as_deref()),
+                node.read_errors
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "N/A".to_string()),
+                node.write_errors
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "N/A".to_string()),
+                node.checksum_errors
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "N/A".to_string())
+            )
+            .unwrap();
+        }
+    }
+
+    if !pool.vdev_io.is_empty() {
+        writeln!(output, "{indent}    vdev io:").unwrap();
+        for row in &pool.vdev_io {
+            writeln!(
+                output,
+                "{indent}      {} read={} write={} rops={} wops={} total_wait_w={} asyncq_wait_w={} syncq_r={} rebuildq_w={}",
+                row.name,
+                format_rate_bytes(row.read_bytes_per_sec),
+                format_rate_bytes(row.write_bytes_per_sec),
+                format_iops(row.read_ops_per_sec),
+                format_iops(row.write_ops_per_sec),
+                format_duration_ns(row.total_wait_write_ns),
+                format_duration_ns(row.async_queue_wait_write_ns),
+                format_queue_pair(row.sync_read_queue_pending, row.sync_read_queue_active),
+                format_queue_pair(row.rebuild_write_queue_pending, row.rebuild_write_queue_active)
+            )
+            .unwrap();
+        }
+    }
+}
+
+fn write_zfs_arc_lines(output: &mut String, arc: Option<&crate::zfs::ArcStats>, indent: &str) {
+    writeln!(output, "{indent}arc:").unwrap();
+    let Some(arc) = arc else {
+        writeln!(output, "{indent}  N/A").unwrap();
+        return;
+    };
+
+    writeln!(
+        output,
+        "{indent}  hit={} miss={} size={} target={} min={} max={}",
+        format_percent(arc.hit_ratio_percent),
+        format_percent(arc.miss_ratio_percent),
+        format_optional_bytes(arc.size_bytes),
+        format_optional_bytes(arc.target_bytes),
+        format_optional_bytes(arc.min_bytes),
+        format_optional_bytes(arc.max_bytes)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "{indent}  data={} metadata={} dbuf={} dnode={} mru={} mfu={}",
+        format_optional_bytes(arc.data_size_bytes),
+        format_optional_bytes(arc.metadata_size_bytes),
+        format_optional_bytes(arc.dbuf_size_bytes),
+        format_optional_bytes(arc.dnode_size_bytes),
+        format_optional_bytes(arc.mru_size_bytes),
+        format_optional_bytes(arc.mfu_size_bytes)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "{indent}  l2 hit={} size={} asize={} read={} write={} writes={}/{} errors={} cksum_bad={} io_error={}",
+        format_percent(arc.l2_hit_ratio_percent),
+        format_optional_bytes(arc.l2_size_bytes),
+        format_optional_bytes(arc.l2_asize_bytes),
+        format_optional_bytes(arc.l2_read_bytes),
+        format_optional_bytes(arc.l2_write_bytes),
+        format_optional_u64(arc.l2_writes_done),
+        format_optional_u64(arc.l2_writes_sent),
+        format_optional_u64(arc.l2_writes_error),
+        format_optional_u64(arc.l2_cksum_bad),
+        format_optional_u64(arc.l2_io_error)
+    )
+    .unwrap();
+}
+
+fn write_zfs_dataset_lines(output: &mut String, datasets: &[crate::zfs::ZfsDataset], indent: &str) {
+    writeln!(output, "{indent}datasets:").unwrap();
+    if datasets.is_empty() {
+        writeln!(output, "{indent}  N/A").unwrap();
+        return;
+    }
+
+    for dataset in datasets {
+        writeln!(
+            output,
+            "{indent}  {} used={} avail={} ref={} mount={} compress={} ratio={}",
+            dataset.name,
+            format_optional_bytes(dataset.used_bytes),
+            format_optional_bytes(dataset.available_bytes),
+            format_optional_bytes(dataset.referenced_bytes),
+            format_optional(dataset.mountpoint.as_deref()),
+            format_optional(dataset.compression.as_deref()),
+            format_ratio(dataset.compressratio)
+        )
+        .unwrap();
+
+        let mut properties = dataset.properties.iter().collect::<Vec<_>>();
+        properties.sort_by_key(|(name, _)| name.as_str());
+        for (name, property) in properties {
+            writeln!(
+                output,
+                "{indent}    {name}: {}",
+                format_zfs_property_value(&property.value)
+            )
+            .unwrap();
+        }
+    }
+}
+
+fn write_zfs_kernel_lines(output: &mut String, kernel: &crate::zfs::ZfsKernelStats, indent: &str) {
+    writeln!(output, "{indent}kernel:").unwrap();
+    if kernel.dbuf.is_none()
+        && kernel.dnode.is_none()
+        && kernel.zil.is_none()
+        && kernel.zfetch.is_none()
+        && kernel.abd.is_none()
+        && kernel.txg.is_none()
+    {
+        writeln!(output, "{indent}  N/A").unwrap();
+        return;
+    }
+
+    if let Some(dbuf) = kernel.dbuf.as_ref() {
+        writeln!(
+            output,
+            "{indent}  dbuf cache={} target={} hash_hits={} hash_misses={} evicts={}",
+            format_optional_bytes(dbuf.cache_size_bytes),
+            format_optional_bytes(dbuf.cache_target_bytes),
+            format_optional_u64(dbuf.hash_hits),
+            format_optional_u64(dbuf.hash_misses),
+            format_optional_u64(dbuf.cache_total_evicts)
+        )
+        .unwrap();
+    }
+    if let Some(dnode) = kernel.dnode.as_ref() {
+        writeln!(
+            output,
+            "{indent}  dnode hold_hits={} hold_misses={} allocate={} buf_evict={}",
+            format_optional_u64(dnode.hold_alloc_hits),
+            format_optional_u64(dnode.hold_alloc_misses),
+            format_optional_u64(dnode.allocate),
+            format_optional_u64(dnode.buf_evict)
+        )
+        .unwrap();
+    }
+    if let Some(zil) = kernel.zil.as_ref() {
+        writeln!(
+            output,
+            "{indent}  zil commits={} itx={} normal_bytes={}",
+            format_optional_u64(zil.commit_count),
+            format_optional_u64(zil.itx_count),
+            format_optional_bytes(zil.itx_metaslab_normal_bytes)
+        )
+        .unwrap();
+    }
+    if let Some(zfetch) = kernel.zfetch.as_ref() {
+        writeln!(
+            output,
+            "{indent}  zfetch hits={} misses={} io_issued={} io_active={}",
+            format_optional_u64(zfetch.hits),
+            format_optional_u64(zfetch.misses),
+            format_optional_u64(zfetch.io_issued),
+            format_optional_u64(zfetch.io_active)
+        )
+        .unwrap();
+    }
+    if let Some(abd) = kernel.abd.as_ref() {
+        writeln!(
+            output,
+            "{indent}  abd linear={} linear_bytes={} scatter={} scatter_bytes={} retry={}",
+            format_optional_u64(abd.linear_count),
+            format_optional_bytes(abd.linear_data_size_bytes),
+            format_optional_u64(abd.scatter_count),
+            format_optional_bytes(abd.scatter_data_size_bytes),
+            format_optional_u64(abd.scatter_page_alloc_retry)
+        )
+        .unwrap();
+    }
+    if let Some(txg) = kernel.txg.as_ref() {
+        writeln!(
+            output,
+            "{indent}  txg latest={} dirty={} written={} writes={}",
+            format_optional_u64(txg.latest_txg),
+            format_optional_bytes(txg.latest_dirty_bytes),
+            format_optional_bytes(txg.latest_written_bytes),
+            format_optional_u64(txg.latest_writes)
+        )
+        .unwrap();
+    }
+}
+
 fn write_zfs_field(output: &mut String, indent: &str, label: &str, value: &str) {
     writeln!(output, "{indent}  {label:<14} {value}").unwrap();
+}
+
+fn write_zfs_nested_field(output: &mut String, indent: &str, label: &str, value: &str) {
+    writeln!(output, "{indent}    {label:<14} {value}").unwrap();
 }
 
 fn write_mdraid_lines(output: &mut String, snapshot: &Snapshot, indent: &str) {
@@ -530,6 +810,40 @@ fn format_optional_bytes(value: Option<u64>) -> String {
     value.map(format_bytes).unwrap_or_else(|| "N/A".to_string())
 }
 
+fn format_optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "N/A".to_string())
+}
+
+fn format_duration_ns(value: Option<u64>) -> String {
+    let Some(value) = value else {
+        return "N/A".to_string();
+    };
+    if value >= 1_000_000 {
+        format!("{:.1} ms", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1} us", value as f64 / 1_000.0)
+    } else {
+        format!("{value} ns")
+    }
+}
+
+fn format_queue_pair(pending: Option<u64>, active: Option<u64>) -> String {
+    format!(
+        "{}/{}",
+        format_optional_u64(pending),
+        format_optional_u64(active)
+    )
+}
+
+fn format_zfs_property_value(value: &str) -> String {
+    value
+        .parse::<u64>()
+        .map(format_bytes)
+        .unwrap_or_else(|_| value.to_string())
+}
+
 fn format_optional(value: Option<&str>) -> &str {
     value.unwrap_or("N/A")
 }
@@ -549,8 +863,14 @@ mod tests {
     use crate::diskstats::DiskActivity;
     use crate::filesystems::FilesystemUsage;
     use crate::raid::MdArray;
+    use crate::zfs::{
+        AbdStats, ArcStats, DbufStats, DnodeStats, TxgSummary, ZfetchStats, ZfsDataset,
+        ZfsKernelStats, ZfsPool, ZfsProperty, ZfsSnapshot, ZfsTopologyNode, ZfsTopologyRole,
+        ZfsVdevIo,
+    };
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::collections::HashMap;
 
     #[test]
     fn text_report_has_stable_section_order_and_empty_values() {
@@ -719,6 +1039,169 @@ devices:
 
         assert!(report.find("sda").unwrap() < report.find("loop0").unwrap());
         assert!(report.find("/dev/sda1").unwrap() < report.find("/dev/loop0").unwrap());
+    }
+
+    #[test]
+    fn text_report_renders_deep_zfs_sections() {
+        let snapshot = full_zfs_snapshot_fixture();
+        let report = format_text_report(&snapshot);
+
+        assert!(report.contains("pools:"));
+        assert!(report.contains("data"));
+        assert!(report.contains("health:"));
+        assert!(report.contains("status:"));
+        assert!(report.contains("action:"));
+        assert!(report.contains("raidz2-0"));
+        assert!(report.contains("vdev io:"));
+        assert!(report.contains("write="));
+        assert!(report.contains("total_wait_w="));
+        assert!(report.contains("syncq_r="));
+        assert!(report.contains("arc:"));
+        assert!(report.contains("hit="));
+        assert!(report.contains("l2"));
+        assert!(report.contains("datasets:"));
+        assert!(report.contains("recordsize:"));
+        assert!(report.contains("kernel:"));
+        assert!(report.contains("dbuf"));
+        assert!(report.contains("dnode"));
+        assert!(report.contains("abd"));
+    }
+
+    #[test]
+    fn text_report_renders_deep_zfs_partial_data_with_diagnostics() {
+        let snapshot = Snapshot {
+            zfs: ZfsSnapshot {
+                deep: true,
+                pools: vec![ZfsPool {
+                    name: "data".to_string(),
+                    health: "ONLINE".to_string(),
+                    ..ZfsPool::default()
+                }],
+                ..ZfsSnapshot::default()
+            },
+            diagnostics: vec!["zfs kstat arcstats unreadable: permission denied".to_string()],
+            ..Snapshot::default()
+        };
+        let report = format_text_report(&snapshot);
+
+        assert!(report.contains("arc:"));
+        assert!(report.contains("N/A"));
+        assert!(report.contains("zfs kstat arcstats unreadable: permission denied"));
+    }
+
+    fn full_zfs_snapshot_fixture() -> Snapshot {
+        let mut properties = HashMap::new();
+        properties.insert(
+            "recordsize".to_string(),
+            ZfsProperty {
+                value: "131072".to_string(),
+                source: Some("default".to_string()),
+            },
+        );
+        properties.insert(
+            "primarycache".to_string(),
+            ZfsProperty {
+                value: "all".to_string(),
+                source: Some("default".to_string()),
+            },
+        );
+
+        Snapshot {
+            zfs: ZfsSnapshot {
+                deep: true,
+                pools: vec![ZfsPool {
+                    name: "data".to_string(),
+                    health: "ONLINE".to_string(),
+                    size_bytes: Some(29_961_691_856_896),
+                    allocated_bytes: Some(10_665_749_323_776),
+                    free_bytes: Some(19_295_942_533_120),
+                    capacity_percent: Some(35.0),
+                    fragmentation_percent: Some(1.0),
+                    dedup_ratio: Some(1.0),
+                    status: Some(
+                        "One or more devices has experienced an unrecoverable error.".to_string(),
+                    ),
+                    action: Some("Replace the faulted device, or use 'zpool clear'.".to_string()),
+                    scan: Some("resilvered 97.1M in 00:23:33 with 0 errors".to_string()),
+                    errors: Some("No known data errors".to_string()),
+                    topology: vec![
+                        ZfsTopologyNode {
+                            name: "raidz2-0".to_string(),
+                            role: ZfsTopologyRole::Vdev,
+                            depth: 1,
+                            state: Some("ONLINE".to_string()),
+                            ..ZfsTopologyNode::default()
+                        },
+                        ZfsTopologyNode {
+                            name: "/dev/sdb".to_string(),
+                            role: ZfsTopologyRole::Disk,
+                            depth: 2,
+                            state: Some("ONLINE".to_string()),
+                            ..ZfsTopologyNode::default()
+                        },
+                    ],
+                    vdev_io: vec![ZfsVdevIo {
+                        name: "data".to_string(),
+                        write_ops_per_sec: Some(382.0),
+                        read_bytes_per_sec: Some(0.0),
+                        write_bytes_per_sec: Some(4_010_886.0),
+                        total_wait_write_ns: Some(3_094_394),
+                        async_queue_wait_write_ns: Some(2_376_632),
+                        sync_read_queue_pending: Some(0),
+                        sync_read_queue_active: Some(0),
+                        rebuild_write_queue_pending: Some(0),
+                        rebuild_write_queue_active: Some(0),
+                        ..ZfsVdevIo::default()
+                    }],
+                    ..ZfsPool::default()
+                }],
+                arc: Some(ArcStats {
+                    hit_ratio_percent: Some(90.0),
+                    size_bytes: Some(1536),
+                    l2_hit_ratio_percent: Some(25.0),
+                    l2_size_bytes: Some(8192),
+                    ..ArcStats::default()
+                }),
+                datasets: vec![ZfsDataset {
+                    name: "data".to_string(),
+                    used_bytes: Some(6_311_953_548_792),
+                    available_bytes: Some(11_187_890_698_760),
+                    referenced_bytes: Some(6_311_795_099_184),
+                    mountpoint: Some("/data".to_string()),
+                    compression: Some("on".to_string()),
+                    compressratio: Some(1.08),
+                    properties,
+                    ..ZfsDataset::default()
+                }],
+                kernel: ZfsKernelStats {
+                    dbuf: Some(DbufStats {
+                        cache_size_bytes: Some(278_614_528),
+                        hash_hits: Some(46_158_602),
+                        ..DbufStats::default()
+                    }),
+                    dnode: Some(DnodeStats {
+                        allocate: Some(222_738),
+                        buf_evict: Some(37_777),
+                        ..DnodeStats::default()
+                    }),
+                    zfetch: Some(ZfetchStats {
+                        io_issued: Some(16_434),
+                        ..ZfetchStats::default()
+                    }),
+                    abd: Some(AbdStats {
+                        scatter_data_size_bytes: Some(8_236_362_240),
+                        ..AbdStats::default()
+                    }),
+                    txg: Some(TxgSummary {
+                        latest_txg: Some(7_628_332),
+                        latest_written_bytes: Some(3_854_336),
+                        ..TxgSummary::default()
+                    }),
+                    ..ZfsKernelStats::default()
+                },
+            },
+            ..Snapshot::default()
+        }
     }
 
     fn render_snapshot(width: u16, height: u16, snapshot: &Snapshot) -> String {
