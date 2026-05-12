@@ -209,27 +209,43 @@ fn write_device_lines(output: &mut String, snapshot: &Snapshot, indent: &str) {
             .rotational
             .map(|value| if value { "yes" } else { "no" })
             .unwrap_or("N/A");
-        writeln!(
+        let logical = device
+            .logical_block_size
+            .map(format_bytes)
+            .unwrap_or_else(|| "N/A".to_string());
+        let physical = device
+            .physical_block_size
+            .map(format_bytes)
+            .unwrap_or_else(|| "N/A".to_string());
+        writeln!(output, "{indent}{}", device.name).unwrap();
+        write_device_field(output, indent, "type:", &device.device_type);
+        write_device_field(output, indent, "size:", &format_bytes(device.size_bytes));
+        write_device_field(output, indent, "rotational:", rotational);
+        write_device_field(output, indent, "logical:", &logical);
+        write_device_field(output, indent, "physical:", &physical);
+        write_device_field(
             output,
-            "{indent}{:<12} type={} size={} rotational={} logical={} physical={} vendor={} model={} serial={}",
-            truncate(&device.name, 12),
-            device.device_type,
-            format_bytes(device.size_bytes),
-            rotational,
-            device
-                .logical_block_size
-                .map(format_bytes)
-                .unwrap_or_else(|| "N/A".to_string()),
-            device
-                .physical_block_size
-                .map(format_bytes)
-                .unwrap_or_else(|| "N/A".to_string()),
+            indent,
+            "vendor:",
             format_optional(device.vendor.as_deref()),
+        );
+        write_device_field(
+            output,
+            indent,
+            "model:",
             format_optional(device.model.as_deref()),
-            format_optional(device.serial.as_deref())
-        )
-        .unwrap();
+        );
+        write_device_field(
+            output,
+            indent,
+            "serial:",
+            format_optional(device.serial.as_deref()),
+        );
     }
+}
+
+fn write_device_field(output: &mut String, indent: &str, label: &str, value: &str) {
+    writeln!(output, "{indent}  {label:<11} {value}").unwrap();
 }
 
 fn ordered_activities(snapshot: &Snapshot) -> Vec<&crate::diskstats::DiskActivity> {
@@ -549,6 +565,42 @@ diagnostics:
         let report = format_text_report(&snapshot);
 
         assert!(report.contains("detail=ARRAY /dev/md0 metadata=1.2 UUID=abc name=host:0"));
+    }
+
+    #[test]
+    fn text_report_formats_device_fields_on_separate_lines() {
+        let snapshot = Snapshot {
+            devices: vec![BlockDevice {
+                name: "nvme0n1".to_string(),
+                device_type: "nvme".to_string(),
+                size_bytes: 1_000_000_000_000,
+                rotational: Some(false),
+                logical_block_size: Some(512),
+                physical_block_size: Some(4096),
+                vendor: Some("ACME".to_string()),
+                model: Some("FastDisk".to_string()),
+                serial: Some("XYZ123".to_string()),
+                ..BlockDevice::default()
+            }],
+            ..Snapshot::default()
+        };
+
+        let report = format_text_report(&snapshot);
+
+        assert!(report.contains(
+            "\
+devices:
+  nvme0n1
+    type:       nvme
+    size:       931.3 GiB
+    rotational: no
+    logical:    512 B
+    physical:   4.0 KiB
+    vendor:     ACME
+    model:      FastDisk
+    serial:     XYZ123
+"
+        ));
     }
 
     #[test]

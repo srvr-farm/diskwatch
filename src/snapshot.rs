@@ -149,8 +149,8 @@ impl Sampler {
 
         let mut devices = collect_block_devices(&self.sys_block_root);
         let duplicate_mappers = duplicate_mappers(&devices);
-        activity = filter_activity(activity, &duplicate_mappers, self.display_options);
         devices = filter_devices(devices, &duplicate_mappers, self.display_options);
+        activity = filter_activity(activity, &devices);
         let filesystems =
             filter_filesystems(collect_filesystems(&self.mounts_path), self.display_options);
         let mut mdraid = read_mdstat(&self.mdstat_path);
@@ -259,13 +259,15 @@ fn duplicate_mappers(devices: &[BlockDevice]) -> HashSet<String> {
 
 fn filter_activity(
     activity: Vec<DiskActivity>,
-    duplicate_mappers: &HashSet<String>,
-    display_options: DisplayOptions,
+    displayed_devices: &[BlockDevice],
 ) -> Vec<DiskActivity> {
+    let displayed_device_names: HashSet<&str> = displayed_devices
+        .iter()
+        .map(|device| device.name.as_str())
+        .collect();
     activity
         .into_iter()
-        .filter(|activity| display_options.show_loop || !is_loop_name(&activity.name))
-        .filter(|activity| !duplicate_mappers.contains(&activity.name))
+        .filter(|activity| displayed_device_names.contains(activity.name.as_str()))
         .collect()
 }
 
@@ -457,6 +459,7 @@ mod tests {
         let file = NamedTempFile::new().unwrap();
         let sys_block = TempDir::new().unwrap();
         let mounts = NamedTempFile::new().unwrap();
+        write(&sys_block.path().join("sda/size"), "2097152\n");
         fs::write(
             file.path(),
             "   8       0 sda 10 0 200 30 5 0 80 20 0 40 50 0 0 0 0 0 0\n",
@@ -485,6 +488,46 @@ mod tests {
         assert_eq!(snapshot.activity[0].name, "sda");
         assert_close(snapshot.activity[0].read_bytes_per_sec.unwrap(), 5_242.88);
         assert_close(snapshot.activity[0].write_bytes_per_sec.unwrap(), 2_621.44);
+    }
+
+    #[test]
+    fn sampler_hides_partition_activity_rows() {
+        let temp = TempDir::new().unwrap();
+        let diskstats = temp.path().join("diskstats");
+        let sys_block = temp.path().join("sys/block");
+        let mounts = temp.path().join("mounts");
+        let mdstat = temp.path().join("mdstat");
+
+        write(
+            &diskstats,
+            "\
+259 0 nvme0n1 10 0 200 0 5 0 80 0 0 40 50 0 0 0 0 0 0
+259 3 nvme0n1p3 10 0 200 0 5 0 80 0 0 40 50 0 0 0 0 0 0
+8 0 sda 10 0 200 0 5 0 80 0 0 40 50 0 0 0 0 0 0
+8 1 sda1 10 0 200 0 5 0 80 0 0 40 50 0 0 0 0 0 0
+",
+        );
+        write(&sys_block.join("nvme0n1/size"), "2097152\n");
+        write(&sys_block.join("sda/size"), "2097152\n");
+        write(&mounts, "");
+        write(&mdstat, "");
+
+        let mut sampler = Sampler::new_for_tests_with_paths(diskstats, sys_block, mounts, mdstat);
+        let started = Instant::now();
+        let _ = sampler.sample_at(started);
+        write(
+            &sampler.diskstats_path,
+            "\
+259 0 nvme0n1 12 0 712 0 9 0 592 0 0 140 150 0 0 0 0 0 0
+259 3 nvme0n1p3 12 0 712 0 9 0 592 0 0 140 150 0 0 0 0 0 0
+8 0 sda 12 0 712 0 9 0 592 0 0 140 150 0 0 0 0 0 0
+8 1 sda1 12 0 712 0 9 0 592 0 0 140 150 0 0 0 0 0 0
+",
+        );
+
+        let snapshot = sampler.sample_at(started + Duration::from_secs(1));
+
+        assert_eq!(names(&snapshot.activity), ["nvme0n1", "sda"]);
     }
 
     #[test]
